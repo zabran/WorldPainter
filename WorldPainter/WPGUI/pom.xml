@@ -41,35 +41,20 @@
             <artifactId>jpen</artifactId>
             <version>${jpen.version}</version>
         </dependency>
-        <!-- If you can't or won't use the JIDE docking framework, you can use the JIDE open source components so that
-             at least the derived Swing controls will work: -->
-        <!--<dependency>-->
-            <!--<groupId>com.jidesoft</groupId>-->
-            <!--<artifactId>jide-oss</artifactId>-->
-            <!--<version>${jide.version}</version>-->
-        <!--</dependency>-->
+        <!-- JIDE Common Layer (open source, Maven Central) — provides JideLabel, TristateCheckBox,
+             CheckBoxTree, LookAndFeelFactory, and a stub Lm. -->
         <dependency>
-            <!-- Commercial product; you will need to download the evaluation version, or obtain a license to use JIDE
-                 (an open source license is free). -->
             <groupId>com.jidesoft</groupId>
-            <artifactId>jide-common</artifactId>
-            <version>${jide.version}</version>
+            <artifactId>jide-oss</artifactId>
+            <version>3.6.18</version>
         </dependency>
+        <!-- DockingFrames Common — replaces the commercial JIDE Docking Framework. The
+             com.jidesoft.docking.* shim classes under src/main/java/com/jidesoft/docking/
+             adapt the JIDE-shaped API surface used by WP onto DockingFrames. -->
         <dependency>
-            <!-- Commercial product; you will need to download the evaluation version, or obtain a license to use JIDE
-                 (an open source license is free). -->
-            <groupId>com.jidesoft</groupId>
-            <artifactId>jide-dock</artifactId>
-            <version>${jide.version}</version>
-        </dependency>
-        <dependency>
-            <!-- Commercial product; you will need to download the evaluation version, or obtain a license to use JIDE
-                 (an open source license is free). This module is only necessary on Linux, to make the GTK look and feel
-                 work correctly. -->
-            <groupId>com.jidesoft</groupId>
-            <artifactId>jide-plaf-jdk7</artifactId>
-            <version>${jide.version}</version>
-            <scope>runtime</scope>
+            <groupId>org.dockingframes</groupId>
+            <artifactId>docking-frames-common</artifactId>
+            <version>1.1.1</version>
         </dependency>
         <dependency>
             <!-- Not in Maven central; here it comes from the worldpainter-private repo. -->
@@ -140,6 +125,15 @@
                 <configuration>
                     <executable>java</executable>
                     <arguments>
+                        <!-- jide-oss 3.6.18 reflects into JDK look-and-feel internals to install
+                             its style extensions; under the JDK 17 module system these accesses
+                             must be opened explicitly. Harmless on platforms where the package
+                             does not exist. -->
+                        <argument>--add-opens=java.desktop/com.sun.java.swing.plaf.windows=ALL-UNNAMED</argument>
+                        <argument>--add-opens=java.desktop/com.sun.java.swing.plaf.gtk=ALL-UNNAMED</argument>
+                        <argument>--add-opens=java.desktop/com.sun.java.swing.plaf.motif=ALL-UNNAMED</argument>
+                        <argument>--add-opens=java.desktop/javax.swing.plaf.basic=ALL-UNNAMED</argument>
+                        <argument>--add-opens=java.desktop/javax.swing.plaf.synth=ALL-UNNAMED</argument>
                         <argument>-cp</argument>
                         <classpath/>
                         <argument>-Dorg.pepsoft.worldpainter.devMode=true</argument>

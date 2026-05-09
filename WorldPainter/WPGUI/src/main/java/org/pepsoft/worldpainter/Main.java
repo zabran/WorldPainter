@@ -457,7 +457,16 @@ public class Main {
                     }
                     logger.debug("Installing look and feel: " + laf);
                     UIManager.setLookAndFeel(laf);
-                    LookAndFeelFactory.installJideExtension();
+                    try {
+                        LookAndFeelFactory.installJideExtension();
+                    } catch (LinkageError e) {
+                        // jide-oss 3.6.18 reflects into JDK look-and-feel internals which the JDK 17
+                        // module system locks down by default. We pass --add-opens at launch, but
+                        // some platforms/L&Fs may still trip over it. Continuing without the JIDE
+                        // L&F extension means a slightly less polished look for JIDE widgets but
+                        // does not affect functionality.
+                        logger.warn("Could not install JIDE L&F extension; continuing without it.", e);
+                    }
                     if (((lookAndFeel == Configuration.LookAndFeel.DARK_METAL)
                             || (lookAndFeel == Configuration.LookAndFeel.DARK_NIMBUS))) {
                         // Patch some things to make dark themes look better

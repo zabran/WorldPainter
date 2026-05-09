@@ -5,3 +5,6 @@ exporttimings.csv
 target
 *.code-workspace
 exports
+
+# Local build infrastructure (portable Maven, install scripts, spike code, run logs)
+/tools/
