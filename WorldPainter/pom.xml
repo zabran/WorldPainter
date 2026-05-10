@@ -109,7 +109,10 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
         <!-- Core dependencies -->
-        <pepsoft.utils.version>2.0.1</pepsoft.utils.version>
+        <!-- Local fork of pepsoft.utils with UnsafeRandom made public + a static fastNextInt
+             helper added (needed by PR #478's Terrain.java perf hotspots). Build instructions in
+             tools/BUILDING-PEPSOFT-UTILS.md. -->
+        <pepsoft.utils.version>2.0.2-local</pepsoft.utils.version>
         <pepsoft.swingutils.version>2.0.0</pepsoft.swingutils.version>
         <pepsoft.jnbt.version>1.0.0</pepsoft.jnbt.version>
         <wp.valueobjects.version>1.2.0</wp.valueobjects.version>
