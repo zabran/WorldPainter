@@ -56,6 +56,14 @@
             <artifactId>docking-frames-common</artifactId>
             <version>1.1.1</version>
         </dependency>
+        <!-- Glass extension — prettier "glass" Eclipse-theme tab painter. Not on Maven Central;
+             built from source under tools/df-source/docking-frames-ext-glass and installed into
+             the local ~/.m2 repository as 1.1.1-local. -->
+        <dependency>
+            <groupId>org.dockingframes</groupId>
+            <artifactId>docking-frames-ext-glass</artifactId>
+            <version>1.1.1-local</version>
+        </dependency>
         <dependency>
             <!-- Not in Maven central; here it comes from the worldpainter-private repo. -->
             <groupId>org.netbeans.swing</groupId>
