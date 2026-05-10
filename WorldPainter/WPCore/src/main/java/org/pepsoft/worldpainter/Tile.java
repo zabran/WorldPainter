@@ -1481,13 +1481,21 @@ public class Tile extends InstanceKeeper implements Serializable, UndoListener, 
 
         // Take the opportunity to save memory and disk space by throwing away "empty" layer buffers. Since this is
         // functionally a null operation there is no need to notify listeners, make the buffer writable or otherwise
-        // notify the undo manager
-        for (Iterator<Map.Entry<Layer, BitSet>> i = bitLayerData.entrySet().iterator(); i.hasNext(); ) {
-            final Map.Entry<Layer, BitSet> entry = i.next();
-            if (entry.getValue().isEmpty()) {
-                i.remove();
-                cachedLayers = null;
+        // notify the undo manager.
+        // Issue #506: bitLayerData (and layerData below) can be null after ensureAllReadable() if
+        // the undo manager hands back a null buffer for the corresponding key — null-guard here
+        // rather than crashing the autosave path.
+        if (bitLayerData != null) {
+            for (Iterator<Map.Entry<Layer, BitSet>> i = bitLayerData.entrySet().iterator(); i.hasNext(); ) {
+                final Map.Entry<Layer, BitSet> entry = i.next();
+                if (entry.getValue().isEmpty()) {
+                    i.remove();
+                    cachedLayers = null;
+                }
             }
+        }
+        if (layerData == null) {
+            return;
         }
         layerLoop:
         for (Iterator<Map.Entry<Layer, byte[]>> i = layerData.entrySet().iterator(); i.hasNext(); ) {
