@@ -604,33 +604,41 @@ public class World2 extends InstanceKeeper implements Serializable, Cloneable {
     }
 
     public synchronized void save(ZipOutputStream out) throws IOException {
-        // First serialise everything but the dimensions to a separate file.
-        // The ObjectOutputStream factory call (vs. `new ObjectOutputStream(out)`) is what makes
-        // this method participate in the compartmentalised save's layer-deduplication scheme: when
-        // WorldIO.saveCompartmentalised has bound a LayerRegistry on this thread, the factory
-        // returns a CompartmentalisedObjectOutputStream that replaces every Layer reference in the
-        // graph with a LayerRef into the shared registry. With no binding, behaviour is identical
-        // to a plain ObjectOutputStream — so callers that aren't going through the
-        // compartmentalised path (none in production today; preserved for any future direct call)
-        // see no change.
+        // 1. world-data.bin — everything but the dimensions
         out.putNextEntry(new ZipEntry("world-data.bin"));
         try {
-            final Map<Anchor, Dimension> savedDimensions = dimensionsByAnchor;
-            try {
-                dimensionsByAnchor = null;
-                final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
-                dataout.writeObject(this);
-                dataout.flush();
-            } finally {
-                dimensionsByAnchor = savedDimensions;
-            }
+            saveWorldDataPayload(out);
         } finally {
             out.closeEntry();
         }
 
-        // Then serialise the dimensions individually
+        // 2. dimension entries (dim-data.bin + region-data-*.bin per dim)
         for (Dimension dimension: dimensionsByAnchor.values()) {
             dimension.save(out);
+        }
+    }
+
+    /**
+     * Write the inner payload of the {@code world-data.bin} entry — the serialised World2 with
+     * {@code dimensionsByAnchor=null}. The caller is responsible for the surrounding
+     * {@code putNextEntry}/{@code closeEntry} pair; we keep this method body lean so it can be
+     * invoked from both {@link #save} and {@link WorldIO#saveCompartmentalised} (incremental
+     * path) without duplicating the null-the-map-during-write dance.
+     *
+     * <p>The factory call (vs. {@code new ObjectOutputStream(out)}) is what enrols this entry in
+     * the compartmentalised save's layer-deduplication scheme: when WorldIO has bound a
+     * {@code LayerRegistry} on this thread, the factory returns a
+     * {@code CompartmentalisedObjectOutputStream} that substitutes Layer references for LayerRef.
+     */
+    synchronized void saveWorldDataPayload(OutputStream out) throws IOException {
+        final Map<Anchor, Dimension> savedDimensions = dimensionsByAnchor;
+        try {
+            dimensionsByAnchor = null;
+            final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
+            dataout.writeObject(this);
+            dataout.flush();
+        } finally {
+            dimensionsByAnchor = savedDimensions;
         }
     }
 

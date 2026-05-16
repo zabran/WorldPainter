@@ -2354,12 +2354,17 @@ public final class App extends JFrame implements BrushControl,
                         // Save the world to a temporary file first, to ensure that there is enough space.
                         // The default (`legacy == false`) is the compartmentalised ZIP format introduced
                         // in 2.27; load auto-detects either format via magic bytes (WorldIO.load(File)).
+                        //
+                        // A4: passing normalisedFile as the prior archive engages the incremental
+                        // save path — clean regions are copied verbatim from the existing file
+                        // instead of being re-serialised. When normalisedFile doesn't exist (first
+                        // save of a new world), the call falls through to a full save.
                         world.addHistoryEntry(HistoryEntry.WORLD_SAVED, normalisedFile);
                         final WorldIO worldIO = new WorldIO(world);
                         if (legacy) {
                             worldIO.save(new FileOutputStream(tempFile));
                         } else {
-                            worldIO.saveCompartmentalised(new FileOutputStream(tempFile));
+                            worldIO.saveCompartmentalised(new FileOutputStream(tempFile), normalisedFile);
                         }
 
                         // If that succeeded, move the existing file out of the way by rotating (if enabled) or deleting
@@ -2528,12 +2533,15 @@ public final class App extends JFrame implements BrushControl,
                 @Override
                 public java.lang.Void execute(ProgressReceiver progressReceiver) {
                     try {
+                        // After rotateAutosaveFile(), the previous autosave is at autosave.0.world.
+                        // Pass it as the prior archive so the incremental-save fast-path engages —
+                        // tens of milliseconds for an autosave instead of tens of seconds when
+                        // only a few regions are dirty.
                         rotateAutosaveFile();
+                        final File priorAutosave = new File(getAutosaveFile().getParentFile(), "autosave.0.world");
                         WorldIO worldIO = new WorldIO(world);
-                        // Autosave writes the new compartmentalised format so that once dirty-region
-                        // tracking lands (A4), autosaves can skip rewriting unchanged regions — the
-                        // entire point of moving to ZIP. Load auto-detects (WorldIO.load(File)).
-                        worldIO.saveCompartmentalised(new FileOutputStream(getAutosaveFile()));
+                        worldIO.saveCompartmentalised(new FileOutputStream(getAutosaveFile()),
+                                priorAutosave.isFile() ? priorAutosave : null);
                     } catch (IOException e) {
                         throw new RuntimeException("I/O error autosaving world (message: " + e.getMessage() + ")", e);
                     }

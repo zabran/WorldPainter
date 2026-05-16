@@ -154,6 +154,69 @@ public class WorldFileSmokeTest extends AbstractTool {
         verifyLayerIdentityPreserved(zipReloaded);
         logger.info("Layer identity across ZIP boundary: PASSED");
 
+        // -------- 5c. A4 — incremental save (this run + a forced-dirty rewrite) --------
+        // First incremental save with no dirty regions: every region should be copied verbatim
+        // from prior. Should be dramatically faster than the full save above.
+        final File zipOut2 = new File(zipOut.getParentFile(), zipOut.getName().replace(".zip", "-2.zip"));
+        if (zipOut2.exists()) { zipOut2.delete(); }
+        // The currently in-memory `world` was loaded fresh — its dirtyRegions are empty.
+        final long incrCleanStart = System.currentTimeMillis();
+        try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(zipOut2), 1 << 20)) {
+            new WorldIO(world).saveCompartmentalised(out, zipOut);
+        }
+        final long incrCleanMs = System.currentTimeMillis() - incrCleanStart;
+        logger.info("Incremental save (0 dirty regions): {} ms ({} bytes) -> {}",
+                incrCleanMs, zipOut2.length(), zipOut2.getName());
+
+        // Now dirty a few tiles so we get a mixed clean/dirty run.
+        final Dimension probeDim = world.getDimensions().iterator().next();
+        int markedDirty = 0;
+        for (Tile probeTile : probeDim.getTiles()) {
+            // Bump (then unbump) a height value so the dimension's heightMapChanged listener
+            // marks the region. Net visible state change is zero.
+            final int x = 0, y = 0;
+            final float orig = probeTile.getHeight(x, y);
+            probeTile.setHeight(x, y, orig + 0.001f);
+            probeTile.setHeight(x, y, orig);
+            markedDirty++;
+            if (markedDirty >= 5) {
+                break;
+            }
+        }
+        final int dirtyRegionCount = probeDim.getDirtyRegions().size();
+        logger.info("Marked {} tiles dirty -> {} dirty regions on {}",
+                markedDirty, dirtyRegionCount, probeDim.getName());
+
+        final File zipOut3 = new File(zipOut.getParentFile(), zipOut.getName().replace(".zip", "-3.zip"));
+        if (zipOut3.exists()) { zipOut3.delete(); }
+        final long incrDirtyStart = System.currentTimeMillis();
+        try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(zipOut3), 1 << 20)) {
+            new WorldIO(world).saveCompartmentalised(out, zipOut2);
+        }
+        final long incrDirtyMs = System.currentTimeMillis() - incrDirtyStart;
+        logger.info("Incremental save ({} dirty regions of {}): {} ms",
+                dirtyRegionCount, probeDim.getDirtyRegions().size() == 0 ? "cleared" : "?",
+                incrDirtyMs);
+        // After save, dirtyRegions should be cleared.
+        if (! probeDim.getDirtyRegions().isEmpty()) {
+            logger.error("A4 FAILED: dirtyRegions not cleared after save: {} still dirty",
+                    probeDim.getDirtyRegions().size());
+            System.exit(8);
+        }
+
+        // Verify the incremental save round-trips.
+        final WorldIO incrReloader = new WorldIO();
+        incrReloader.loadCompartmentalised(zipOut3);
+        int incrReloadedTiles = 0;
+        for (Dimension dim : incrReloader.getWorld().getDimensions()) {
+            incrReloadedTiles += dim.getTileCount();
+        }
+        if (incrReloadedTiles != totalTiles) {
+            logger.error("A4 INCREMENTAL ROUND-TRIP FAILED: {} tiles, expected {}", incrReloadedTiles, totalTiles);
+            System.exit(8);
+        }
+        logger.info("Incremental round-trip: PASSED");
+
         // -------- 6. Verify magic-byte dispatch in load(File) --------
         // The whole point of A1 is that callers can hand the same File to load() and the right
         // path runs automatically. Round-trip both formats via load(File) and confirm tile counts.

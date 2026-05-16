@@ -52,6 +52,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
 import static java.lang.Math.ceil;
@@ -436,6 +437,10 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             }
             fireTileAdded(tile);
             changeNo++;
+            // A4: an added tile changes the region's contents; the incremental save must
+            // re-serialise this region. NB attachTileFromLoad (the deserialisation path) skips
+            // this method entirely — loading isn't a user edit.
+            markRegionDirty(tile);
         } finally {
             writeLock.unlock();
         }
@@ -485,6 +490,10 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             }
             fireTileRemoved(tile);
             changeNo++;
+            // A4: a removed tile changes the region's contents; the incremental save must
+            // re-serialise this region (or, if no tiles remain in it, ensure the region entry
+            // is dropped from the new archive).
+            markRegionDirty(tile);
         } finally {
             writeLock.unlock();
         }
@@ -2326,53 +2335,12 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
         try {
             setEventsInhibited(true);
             try {
-                // First serialise everything but the tiles to a separate file. See the comment in
-                // World2.save for what the CompartmentalisedSerialisation factory does — in short:
-                // when the caller has bound a LayerRegistry, the returned stream substitutes
-                // LayerRef placeholders for every Layer flowing through it.
-                final String path = anchor + "/";
-                out.putNextEntry(new ZipEntry(path + "dim-data.bin"));
-                try {
-                    final Map<Point, Tile> savedTiles = tiles;
-                    final World2 savedWorld = world;
-                    try {
-                        tiles = null;
-                        world = null;
-                        final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
-                        dataout.writeObject(this);
-                        dataout.flush();
-                    } finally {
-                        tiles = savedTiles;
-                        world = savedWorld;
-                    }
-                } finally {
-                    out.closeEntry();
-                }
-
-                // Then serialise the tiles, grouped by region
-                final int regionX1 = lowestX >> 2, regionX2 = highestX >> 2, regionY1 = lowestY >> 2, regionY2 = highestY >> 2;
-                for (int regionX = regionX1; regionX <= regionX2; regionX++) {
-                    for (int regionY = regionY1; regionY <= regionY2; regionY++) {
-                        final List<Tile> tileList = new ArrayList<>();
-                        for (int tileX = 0; tileX < 4; tileX++) {
-                            for (int tileY = 0; tileY < 4; tileY++) {
-                                final Tile tile = tiles.get(new Point((regionX << 2) | tileX, (regionY << 2) | tileY));
-                                if (tile != null) {
-                                    tile.prepareForSaving();
-                                    tileList.add(tile);
-                                }
-                            }
-                        }
-
-                        out.putNextEntry(new ZipEntry(path + "region-data-" + regionX + "," + regionY + ".bin"));
-                        try {
-                            final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
-                            dataout.writeObject(tileList);
-                            dataout.flush();
-                        } finally {
-                            out.closeEntry();
-                        }
-                    }
+                // 1. dim-data.bin
+                writeDimDataEntry(out);
+                // 2. all region-data entries (every currently-tiled region)
+                final Set<Point> currentRegions = collectCurrentRegions();
+                for (Point r : currentRegions) {
+                    writeRegionDataEntry(r.x, r.y, out);
                 }
             } finally {
                 setEventsInhibited(false);
@@ -2382,41 +2350,217 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
         }
     }
 
+    /**
+     * Write the {@code <anchor>/dim-data.bin} entry. The {@code tiles} and {@code world} fields
+     * are temporarily nulled to keep them out of this entry — they're streamed separately
+     * (tiles via per-region entries, world reconstructed by the loader's world↔dim relinking).
+     * See {@link #attachWorldFromLoad} / {@link WorldIO#loadCompartmentalised} for the inverse.
+     */
+    private void writeDimDataEntry(ZipOutputStream out) throws IOException {
+        final String path = anchor + "/";
+        out.putNextEntry(new ZipEntry(path + "dim-data.bin"));
+        try {
+            writeDimDataPayload(out);
+        } finally {
+            out.closeEntry();
+        }
+    }
+
+    /**
+     * Just the bytes of {@code dim-data.bin} — no surrounding ZIP entry framing. Public so
+     * {@link WorldIO#saveCompartmentalised} can use it on top of a {@code ZipArchiveOutputStream}
+     * (commons-compress) for the incremental-save fast path, which doesn't go through
+     * {@link ZipOutputStream}.
+     */
+    public void writeDimDataPayload(OutputStream out) throws IOException {
+        final Map<Point, Tile> savedTiles = tiles;
+        final World2 savedWorld = world;
+        try {
+            tiles = null;
+            world = null;
+            final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
+            dataout.writeObject(this);
+            dataout.flush();
+        } finally {
+            tiles = savedTiles;
+            world = savedWorld;
+        }
+    }
+
+    /**
+     * Write a single {@code <anchor>/region-data-X,Y.bin} entry. Collects up to 16 tiles from the
+     * 4×4 region grid, calls {@code prepareForSaving()} on each, and serialises the list. Uses
+     * the {@link org.pepsoft.worldpainter.io.CompartmentalisedSerialisation} stream factory so
+     * that when the caller has bound a {@code LayerRegistry}, Layer references in the tiles are
+     * substituted with {@code LayerRef}s.
+     */
+    private void writeRegionDataEntry(int regionX, int regionY, ZipOutputStream out) throws IOException {
+        final String path = anchor + "/";
+        out.putNextEntry(new ZipEntry(path + "region-data-" + regionX + "," + regionY + ".bin"));
+        try {
+            writeRegionDataPayload(regionX, regionY, out);
+        } finally {
+            out.closeEntry();
+        }
+    }
+
+    /**
+     * Just the bytes of a single {@code region-data-X,Y.bin} entry — no surrounding ZIP entry
+     * framing. Public so {@link WorldIO#saveCompartmentalised} can use it on top of a
+     * {@code ZipArchiveOutputStream} (commons-compress) for the incremental-save fast path.
+     */
+    public void writeRegionDataPayload(int regionX, int regionY, OutputStream out) throws IOException {
+        final List<Tile> tileList = new ArrayList<>();
+        for (int tileX = 0; tileX < 4; tileX++) {
+            for (int tileY = 0; tileY < 4; tileY++) {
+                final Tile tile = tiles.get(new Point((regionX << 2) | tileX, (regionY << 2) | tileY));
+                if (tile != null) {
+                    tile.prepareForSaving();
+                    tileList.add(tile);
+                }
+            }
+        }
+        final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
+        dataout.writeObject(tileList);
+        dataout.flush();
+    }
+
+    /**
+     * Public view of {@link #collectCurrentRegions}. Used by the incremental save path in
+     * {@link WorldIO#saveCompartmentalised} to enumerate the regions that need to be either
+     * spliced from the prior archive or freshly written.
+     */
+    public Set<Point> getCurrentRegions() {
+        return collectCurrentRegions();
+    }
+
+    /**
+     * Public exposure of the read-lock acquire+events-inhibit ceremony around a save, so the
+     * incremental save path in {@link WorldIO} can run the whole per-dim save block under the
+     * right lock without {@link Dimension} having to know about {@code ZipArchiveOutputStream}.
+     */
+    public void withReadLockedSaveContext(IORunnable body) throws IOException {
+        readLock.lock();
+        try {
+            setEventsInhibited(true);
+            try {
+                body.run();
+            } finally {
+                setEventsInhibited(false);
+            }
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    /** {@link Runnable} that's allowed to throw {@link IOException}. */
+    @FunctionalInterface
+    public interface IORunnable {
+        void run() throws IOException;
+    }
+
+    /** Enumerate every currently-tiled 4×4 region. Returned set is independent of {@link #dirtyRegions}. */
+    private Set<Point> collectCurrentRegions() {
+        final Set<Point> regions = new LinkedHashSet<>();
+        for (Point tileCoord : tiles.keySet()) {
+            regions.add(new Point(tileCoord.x >> 2, tileCoord.y >> 2));
+        }
+        return regions;
+    }
+
     // Tile.Listener
 
     @Override
     public void heightMapChanged(Tile tile) {
         changeNo++;
+        markRegionDirty(tile);
     }
 
     @Override
     public void terrainChanged(Tile tile) {
         changeNo++;
+        markRegionDirty(tile);
     }
 
     @Override
     public void waterLevelChanged(Tile tile) {
         changeNo++;
+        markRegionDirty(tile);
     }
 
     @Override
     public void seedsChanged(Tile tile) {
         changeNo++;
+        markRegionDirty(tile);
     }
 
     @Override
     public void layerDataChanged(Tile tile, Set<Layer> changedLayers) {
         changeNo++;
+        markRegionDirty(tile);
     }
 
     @Override
     public void allBitLayerDataChanged(Tile tile) {
         changeNo++;
+        markRegionDirty(tile);
     }
 
     @Override
     public void allNonBitlayerDataChanged(Tile tile) {
         changeNo++;
+        markRegionDirty(tile);
+    }
+
+    // ---- A4 dirty-region tracking ----
+
+    /**
+     * Mark the 4×4-tile region containing this tile as needing to be re-serialised on the next
+     * compartmentalised save. Called from every {@link Tile.Listener} callback in this class.
+     * Cheap (adds a {@link Point} to a {@link HashSet}); the set is bounded by the number of
+     * regions in the world, not the number of edits.
+     */
+    private void markRegionDirty(Tile tile) {
+        if (dirtyRegions != null) {
+            dirtyRegions.add(new Point(tile.getX() >> 2, tile.getY() >> 2));
+        }
+    }
+
+    /**
+     * Read-only snapshot of regions whose tiles have been edited since the last save. Empty for
+     * a freshly-loaded world (post-load the dim's on-disk state matches its in-memory state).
+     * Empty after {@link #clearDirtyRegions} — called by the incremental save path once a
+     * {@code .world.zip} write completes successfully.
+     */
+    public Set<Point> getDirtyRegions() {
+        return (dirtyRegions != null) ? new HashSet<>(dirtyRegions) : Collections.emptySet();
+    }
+
+    /**
+     * Clear the dirty-region set. Called by {@link WorldIO#saveCompartmentalised} after a
+     * successful incremental save: post-write the on-disk archive once again reflects the
+     * in-memory state, so nothing is dirty.
+     */
+    public void clearDirtyRegions() {
+        if (dirtyRegions != null) {
+            dirtyRegions.clear();
+        }
+    }
+
+    /**
+     * Force every existing region into the dirty set. Used by the incremental save path when the
+     * prior archive cannot be opened (missing, corrupt, pre-A3 — no {@code layers.bin}). The save
+     * then degrades cleanly to "rewrite everything" without losing the incremental-save code path.
+     */
+    public void markAllRegionsDirty() {
+        if (dirtyRegions == null) {
+            dirtyRegions = new HashSet<>();
+        }
+        if (tiles != null) {
+            for (Point tileCoord : tiles.keySet()) {
+                dirtyRegions.add(new Point(tileCoord.x >> 2, tileCoord.y >> 2));
+            }
+        }
     }
 
     // UndoListener
@@ -2592,6 +2736,7 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
         dirtyTiles = new HashSet<>();
         addedTiles = new HashSet<>();
         removedTiles = new HashSet<>();
+        dirtyRegions = new HashSet<>();
         propertyChangeSupport = new PropertyChangeSupport(this);
         garden = new WPGarden();
         topLayerDepthNoise = new PerlinNoise(seed + TOP_LAYER_DEPTH_SEED_OFFSET);
@@ -2866,6 +3011,13 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
     private transient Set<Tile> dirtyTiles = new HashSet<>();
     private transient Set<Tile> addedTiles = new HashSet<>();
     private transient Set<Tile> removedTiles = new HashSet<>();
+    /**
+     * Coords (in 4×4-tile region space, i.e. {@code regionX = tileX >> 2}) of regions whose
+     * content has changed since the last successful compartmentalised save. Drives A4's
+     * incremental-save path: the saver copies clean regions verbatim from the prior archive and
+     * only re-serialises the dirty ones. Transient — a freshly-loaded world starts clean.
+     */
+    private transient Set<Point> dirtyRegions = new HashSet<>();
     private transient UndoManager undoManager;
     private transient PropertyChangeSupport propertyChangeSupport = new PropertyChangeSupport(this);
     private transient WPGarden garden = new WPGarden();

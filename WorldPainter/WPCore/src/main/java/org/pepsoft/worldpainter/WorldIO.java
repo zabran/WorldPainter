@@ -2,6 +2,10 @@ package org.pepsoft.worldpainter;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.awt.Point;
 import org.pepsoft.minecraft.Direction;
 import org.pepsoft.minecraft.SeededGenerator;
 import org.pepsoft.minecraft.SuperflatGenerator;
@@ -96,6 +100,16 @@ public class WorldIO {
      * at the end because {@link ZipFile} indexes the central directory, not the entry order.
      */
     public void saveCompartmentalised(OutputStream out) throws IOException {
+        saveCompartmentalisedFull(out);
+    }
+
+    /**
+     * Full (non-incremental) compartmentalised save. Writes every region fresh, regardless of
+     * dirty status. Used (a) when there's no prior archive to copy from, (b) when the prior is
+     * corrupted/missing/pre-A3, and (c) by the public single-arg {@link #saveCompartmentalised}
+     * overload.
+     */
+    private void saveCompartmentalisedFull(OutputStream out) throws IOException {
         final org.pepsoft.worldpainter.io.LayerRegistry registry = new org.pepsoft.worldpainter.io.LayerRegistry();
         try (ZipOutputStream wrappedOut = new ZipOutputStream(out)) {
             final ObjectMapper objectMapper = new ObjectMapper()
@@ -111,8 +125,7 @@ public class WorldIO {
                 world.save(wrappedOut);
             });
 
-            // Now write the registry, using a plain stream — its contents *are* the Layer
-            // instances, so we don't want them to round-trip through LayerRef.
+            // Layers registry — always last.
             wrappedOut.putNextEntry(new ZipEntry("layers.bin"));
             try {
                 final ObjectOutputStream layersOut = new ObjectOutputStream(wrappedOut);
@@ -121,6 +134,195 @@ public class WorldIO {
             } finally {
                 wrappedOut.closeEntry();
             }
+        }
+
+        // Successful full save → on-disk archive matches in-memory state.
+        for (Dimension dim : world.getDimensions()) {
+            dim.clearDirtyRegions();
+        }
+    }
+
+    /**
+     * Incremental save: write the world to {@code out} in the compartmentalised ZIP format,
+     * but for every region whose tiles haven't been edited since the world was loaded, copy the
+     * region's entry verbatim from {@code priorFile} instead of re-serialising the tiles. This is
+     * the A4 optimisation — turns a ~14 s full rewrite of a 65 MB world into a fraction of a
+     * second when only a handful of regions are dirty.
+     *
+     * <p>The incremental fast-path engages only when:
+     * <ol>
+     *   <li>{@code priorFile} is non-null and a readable ZIP, AND</li>
+     *   <li>The prior archive contains a {@code layers.bin} entry (it was written by A3+).</li>
+     * </ol>
+     * Otherwise the method falls through to a full rewrite — clean degradation if the prior file
+     * is corrupted, missing, or in the pre-A3 format.
+     *
+     * <p>When the fast-path engages, the new archive's {@link org.pepsoft.worldpainter.io.LayerRegistry}
+     * is seeded with the prior archive's registry (via
+     * {@link org.pepsoft.worldpainter.io.LayerRegistry#registerKeepingPreviousIndices}) so that
+     * every copied region entry's {@code LayerRef(i)} continues to resolve to the same Layer it
+     * did before. Any new layers added since the prior save are appended at the end.
+     *
+     * <p>After a successful save, every dimension's {@code dirtyRegions} set is cleared — the
+     * on-disk archive now matches the in-memory state.
+     *
+     * @param out The output stream for the new archive. Closed before return.
+     * @param priorFile The archive to incrementally rewrite, or {@code null} for a full save.
+     */
+    public void saveCompartmentalised(OutputStream out, File priorFile) throws IOException {
+        // Quick gate: if the prior file isn't usable, fall through to the full-save path.
+        if (priorFile == null || !priorFile.isFile() || !priorHasLayersBin(priorFile)) {
+            logger.info("saveCompartmentalised: full path (no prior or prior unusable)");
+            saveCompartmentalisedFull(out);
+            return;
+        }
+        saveCompartmentalisedIncremental(out, priorFile);
+    }
+
+    /** Cheap pre-check that the prior file looks like an A3+ compartmentalised archive. */
+    private static boolean priorHasLayersBin(File priorFile) {
+        try (ZipFile zf = new ZipFile(priorFile)) {
+            return zf.getEntry("layers.bin") != null;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Incremental save body, using Apache commons-compress so we can splice the prior archive's
+     * clean region entries verbatim via {@link org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream#addRawArchiveEntry}.
+     * Stock {@link java.util.zip.ZipOutputStream} doesn't expose this — it would force a
+     * decompress+recompress round-trip per copied entry, eating the perf savings we're chasing.
+     */
+    private void saveCompartmentalisedIncremental(OutputStream out, File priorFile) throws IOException {
+        final org.pepsoft.worldpainter.io.LayerRegistry priorRegistry;
+        try (org.apache.commons.compress.archivers.zip.ZipFile priorAce =
+                     org.apache.commons.compress.archivers.zip.ZipFile.builder().setFile(priorFile).get()) {
+            final org.apache.commons.compress.archivers.zip.ZipArchiveEntry layersEntry = priorAce.getEntry("layers.bin");
+            try (ObjectInputStream layersIn = new WPCustomObjectInputStream(
+                    priorAce.getInputStream(layersEntry),
+                    PluginManager.getPluginClassLoader(),
+                    AbstractObject.class)) {
+                final Object obj = layersIn.readObject();
+                if (! (obj instanceof org.pepsoft.worldpainter.io.LayerRegistry)) {
+                    logger.warn("saveCompartmentalised: prior layers.bin is the wrong type; falling back to full save");
+                    saveCompartmentalised(out);
+                    return;
+                }
+                priorRegistry = (org.pepsoft.worldpainter.io.LayerRegistry) obj;
+            } catch (ClassNotFoundException | RuntimeException e) {
+                logger.warn("saveCompartmentalised: could not read prior layers.bin ({}); falling back to full save", e.toString());
+                saveCompartmentalised(out);
+                return;
+            }
+        }
+
+        final org.pepsoft.worldpainter.io.LayerRegistry registry = new org.pepsoft.worldpainter.io.LayerRegistry();
+        registry.registerKeepingPreviousIndices(priorRegistry.getLayers());
+
+        try (org.apache.commons.compress.archivers.zip.ZipFile priorAce =
+                     org.apache.commons.compress.archivers.zip.ZipFile.builder().setFile(priorFile).get();
+             org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream zaos =
+                     new org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream(out)) {
+
+            // 1. metadata.json — always fresh.
+            zaos.putArchiveEntry(new org.apache.commons.compress.archivers.zip.ZipArchiveEntry("metadata.json"));
+            try {
+                final ObjectMapper objectMapper = new ObjectMapper()
+                        .disable(AUTO_CLOSE_TARGET)
+                        .disable(WRITE_DATES_AS_TIMESTAMPS);
+                objectMapper.writeValue(zaos, getMetadata());
+            } finally {
+                zaos.closeArchiveEntry();
+            }
+
+            int copiedCount = 0, freshCount = 0;
+            long copyNs = 0, freshNs = 0;
+
+            // 2. world-data.bin (always fresh — top-level state may have changed).
+            org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withSaveBinding(registry, () -> {
+                writeFreshEntry(zaos, "world-data.bin", world::saveWorldDataPayload);
+            });
+
+            final long ts0 = System.nanoTime();
+            for (Dimension dim : world.getDimensions()) {
+                final Set<Point> dirty = dim.getDirtyRegions();
+                final String prefix = dim.getAnchor() + "/";
+                dim.withReadLockedSaveContext(() -> {
+                    // dim-data.bin always fresh.
+                    org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withSaveBinding(registry, () -> {
+                        writeFreshEntry(zaos, prefix + "dim-data.bin", dim::writeDimDataPayload);
+                    });
+                });
+                for (Point r : dim.getCurrentRegions()) {
+                    final String entryName = prefix + "region-data-" + r.x + "," + r.y + ".bin";
+                    final org.apache.commons.compress.archivers.zip.ZipArchiveEntry priorEntry =
+                            (!dirty.contains(r)) ? priorAce.getEntry(entryName) : null;
+                    if (priorEntry != null) {
+                        // RAW SPLICE — the whole point of A4 with commons-compress.
+                        final long t = System.nanoTime();
+                        final org.apache.commons.compress.archivers.zip.ZipArchiveEntry newEntry =
+                                new org.apache.commons.compress.archivers.zip.ZipArchiveEntry(entryName);
+                        newEntry.setMethod(priorEntry.getMethod());
+                        newEntry.setSize(priorEntry.getSize());
+                        newEntry.setCompressedSize(priorEntry.getCompressedSize());
+                        newEntry.setCrc(priorEntry.getCrc());
+                        try (InputStream rawIn = priorAce.getRawInputStream(priorEntry)) {
+                            zaos.addRawArchiveEntry(newEntry, rawIn);
+                        }
+                        copiedCount++;
+                        copyNs += System.nanoTime() - t;
+                    } else {
+                        final long t = System.nanoTime();
+                        final Dimension dimCapture = dim;
+                        final int rxCapture = r.x, ryCapture = r.y;
+                        org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withSaveBinding(registry, () -> {
+                            writeFreshEntry(zaos, entryName,
+                                    o -> dimCapture.writeRegionDataPayload(rxCapture, ryCapture, o));
+                        });
+                        freshCount++;
+                        freshNs += System.nanoTime() - t;
+                    }
+                }
+            }
+            logger.info("saveCompartmentalised: {} regions copied raw in {} ms, {} regions freshly serialised in {} ms",
+                    copiedCount, copyNs / 1_000_000,
+                    freshCount, freshNs / 1_000_000);
+
+            // 3. layers.bin — always last, always fresh. Plain stream because the contents are
+            // the Layer instances themselves; we don't want them round-tripped through LayerRef.
+            zaos.putArchiveEntry(new org.apache.commons.compress.archivers.zip.ZipArchiveEntry("layers.bin"));
+            try {
+                final ObjectOutputStream layersOut = new ObjectOutputStream(zaos);
+                layersOut.writeObject(registry);
+                layersOut.flush();
+            } finally {
+                zaos.closeArchiveEntry();
+            }
+        }
+
+        // Successful save → clear dirty sets so a subsequent save sees a clean slate.
+        for (Dimension dim : world.getDimensions()) {
+            dim.clearDirtyRegions();
+        }
+    }
+
+    /** Functional interface accepting {@link OutputStream} that can throw {@link IOException}. */
+    @FunctionalInterface
+    private interface PayloadWriter {
+        void writeTo(OutputStream out) throws IOException;
+    }
+
+    /** Wrap a payload write between {@code putArchiveEntry}/{@code closeArchiveEntry}. */
+    private static void writeFreshEntry(
+            org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream zaos,
+            String entryName,
+            PayloadWriter payload) throws IOException {
+        zaos.putArchiveEntry(new org.apache.commons.compress.archivers.zip.ZipArchiveEntry(entryName));
+        try {
+            payload.writeTo(zaos);
+        } finally {
+            zaos.closeArchiveEntry();
         }
     }
 
@@ -569,4 +771,6 @@ public class WorldIO {
     }
 
     private World2 world;
+
+    private static final Logger logger = LoggerFactory.getLogger(WorldIO.class);
 }
