@@ -439,31 +439,39 @@ public class MaterialSelector extends javax.swing.JPanel {
             }
             if (material != oldMaterial) {
                 firePropertyChange("material", null, material);
-                maybeWarnVersionMismatch(oldMaterial, material, previousProgrammaticChange);
             }
+            // Always check, regardless of whether updateMaterial saw an identity change. The
+            // earlier "warn on diff" design didn't work: minecraftNameChanged() assigns
+            // this.material *before* calling getMaterial() → updateMaterial(), so by the time we
+            // get here oldMaterial is already the new block. Dedup is handled by the warnedAbout
+            // set instead — same block won't re-fire.
+            maybeWarnVersionMismatch(material);
         } finally {
             programmaticChange = previousProgrammaticChange;
         }
     }
 
     /**
-     * If the user has just chosen a block that's incompatible with the current target platform's
-     * MC version (e.g. {@code minecraft:dirt_path} on a 1.16 map), surface a non-blocking
-     * warning. Suppressed when {@code setMaterial} was called programmatically (we don't want to
-     * pester the user about choices that weren't theirs), and de-duplicated per material name so
-     * editing properties on the same block doesn't re-fire it.
+     * If the currently selected block is incompatible with the target platform's MC version
+     * (e.g. {@code minecraft:dirt_path} on a 1.16 map), surface a non-blocking warning. We
+     * de-duplicate per material name in this selector's lifetime — picking the same block again,
+     * or merely tweaking its properties, doesn't re-fire.
+     *
+     * <p>Called from {@link #updateMaterial} which is itself only reached via user-driven event
+     * handlers (combo-box selection, property editors, focus loss). {@code setMaterial}
+     * intentionally assigns {@code this.material} directly without going through {@code
+     * updateMaterial}, so programmatic loads do not trigger this hook.
      */
-    private void maybeWarnVersionMismatch(Material oldMaterial, Material newMaterial,
-                                          boolean wasProgrammaticChange) {
-        if (wasProgrammaticChange || platform == null || newMaterial == null) {
+    private void maybeWarnVersionMismatch(Material currentMaterial) {
+        if (platform == null || currentMaterial == null) {
             return;
         }
-        if (oldMaterial != null && newMaterial.name.equals(oldMaterial.name)) {
-            return; // same block, just properties tweaked
-        }
-        String message = MaterialVersions.checkCompatibility(newMaterial, platform);
-        if (message == null || !warnedAbout.add(newMaterial.name)) {
+        String message = MaterialVersions.checkCompatibility(currentMaterial, platform);
+        if (message == null) {
             return;
+        }
+        if (!warnedAbout.add(currentMaterial.name)) {
+            return; // already warned about this exact block; don't spam
         }
         doLaterOnEventThread(() -> beepAndShowWarning(this, message
                 + "\n\nThis is only a warning — the block stays selected. Adjust your target"
@@ -471,7 +479,16 @@ public class MaterialSelector extends javax.swing.JPanel {
                 "Version-Incompatible Block"));
     }
 
-    /** Blocks we've already warned about in this selector's lifetime, to avoid spamming. */
+    /**
+     * Blocks we've already warned about in this selector's lifetime, to avoid spamming.
+     *
+     * <p><strong>Known minor "feature":</strong> the dedup is per-{@code MaterialSelector}
+     * instance, so re-opening the Custom Material dialog on a saved custom terrain whose block
+     * is version-incompatible fires the warning again. That's intentional-ish — it surfaces the
+     * mismatch every time you visit it, which is arguably useful as a reminder. A
+     * Configuration-level "don't show this for material X again" suppression would be the
+     * proper fix if anyone finds it annoying.
+     */
     private final Set<String> warnedAbout = new HashSet<>();
 
     /**
