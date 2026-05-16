@@ -35,7 +35,11 @@ public class LoadWorldTask implements ProgressTask<World2> {
     public World2 execute(ProgressReceiver progressReceiver) {
         try {
             WorldIO worldIO = new WorldIO();
-            worldIO.load(new FileInputStream(file));
+            // Use the File overload so the magic-byte sniffer can dispatch directly to
+            // loadCompartmentalised when the on-disk format is the new ZIP. The InputStream path
+            // would also work but it has to spool the whole file to a temp first, which adds a
+            // pointless 65 MB-or-more disk round-trip.
+            worldIO.load(file);
             World2 world = worldIO.getWorld();
             if (logger.isDebugEnabled() && (world.getMetadata() != null)) {
                 logMetadataAsDebug(world.getMetadata());

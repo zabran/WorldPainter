@@ -2183,10 +2183,24 @@ public final class App extends JFrame implements BrushControl,
      * Ask for a filename and save the world with that name. If a file exists
      * with the name, ask for confirmation to overwrite it. Shows a progress
      * indicator while saving, and a confirmation when it is saved.
-     * 
+     *
      * @return {@code true} if the file was saved.
      */
     private boolean saveAs() {
+        return saveAs(false);
+    }
+
+    /**
+     * Same as {@link #saveAs()} but writes the legacy GZIP-wrapped single-stream format instead
+     * of the default compartmentalised ZIP. Wired up to a separate menu item so a user who has a
+     * good reason to need the old format (sharing with vanilla WorldPainter < 2.27, debugging a
+     * suspect new-format file, etc.) can opt in explicitly without losing their current save.
+     */
+    private boolean saveAsLegacy() {
+        return saveAs(true);
+    }
+
+    private boolean saveAs(boolean legacy) {
         if (world == null) {
             DesktopUtils.beep();
             return false;
@@ -2202,7 +2216,10 @@ public final class App extends JFrame implements BrushControl,
                     file = new File(DesktopUtils.getDocumentsFolder(), org.pepsoft.util.FileUtils.sanitiseName(world.getName().trim() + ".world"));
                 }
             }
-            file = FileUtils.selectFileForSave(App.this, "Save as a WorldPainter world", file, new FileFilter() {
+            final String dialogTitle = legacy
+                    ? "Save as a legacy WorldPainter world (GZIP format)"
+                    : "Save as a WorldPainter world";
+            file = FileUtils.selectFileForSave(App.this, dialogTitle, file, new FileFilter() {
                 @Override
                 public boolean accept(File f) {
                     return f.isDirectory()
@@ -2226,7 +2243,7 @@ public final class App extends JFrame implements BrushControl,
                 if (file.exists() && (showConfirmDialog(App.this, strings.getString("do.you.want.to.overwrite.the.file"), strings.getString("file.exists"), YES_NO_OPTION) != YES_OPTION)) {
                     return false;
                 }
-                if (save(file)) {
+                if (save(file, legacy)) {
                     showInfo(App.this, strings.getString("file.saved"), strings.getString("success"));
                     return true;
                 }
@@ -2240,10 +2257,23 @@ public final class App extends JFrame implements BrushControl,
     /**
      * Save the world to the specified file, overwriting it if it already exists
      * without asking for confirmation. Shows a progress indicator while saving.
-     * 
+     *
      * @param file The file to which to save the world.
      */
     private boolean save(File file) {
+        return save(file, false);
+    }
+
+    /**
+     * Same as {@link #save(File)} but lets the caller pick the on-disk format.
+     *
+     * @param file The file to which to save the world.
+     * @param legacy {@code true} to write the legacy GZIP single-stream format,
+     *     {@code false} (the default for everything but {@link #saveAsLegacy()}) to write the
+     *     new compartmentalised ZIP format. Load auto-detects the format via magic bytes — see
+     *     {@link WorldIO#load(File)}.
+     */
+    private boolean save(File file, boolean legacy) {
         if (world == null) {
             DesktopUtils.beep();
             return false;
@@ -2321,10 +2351,16 @@ public final class App extends JFrame implements BrushControl,
                         throw new RuntimeException("Temporary file " + tempFile.getName() + " already exists; delete it and try again");
                     }
                     try {
-                        // Save the world to a temporary file first, to ensure that there is enough space
+                        // Save the world to a temporary file first, to ensure that there is enough space.
+                        // The default (`legacy == false`) is the compartmentalised ZIP format introduced
+                        // in 2.27; load auto-detects either format via magic bytes (WorldIO.load(File)).
                         world.addHistoryEntry(HistoryEntry.WORLD_SAVED, normalisedFile);
                         final WorldIO worldIO = new WorldIO(world);
-                        worldIO.save(new FileOutputStream(tempFile));
+                        if (legacy) {
+                            worldIO.save(new FileOutputStream(tempFile));
+                        } else {
+                            worldIO.saveCompartmentalised(new FileOutputStream(tempFile));
+                        }
 
                         // If that succeeded, move the existing file out of the way by rotating (if enabled) or deleting
                         // it
@@ -2494,7 +2530,10 @@ public final class App extends JFrame implements BrushControl,
                     try {
                         rotateAutosaveFile();
                         WorldIO worldIO = new WorldIO(world);
-                        worldIO.save(new FileOutputStream(getAutosaveFile()));
+                        // Autosave writes the new compartmentalised format so that once dirty-region
+                        // tracking lands (A4), autosaves can skip rewriting unchanged regions — the
+                        // entire point of moving to ZIP. Load auto-detects (WorldIO.load(File)).
+                        worldIO.saveCompartmentalised(new FileOutputStream(getAutosaveFile()));
                     } catch (IOException e) {
                         throw new RuntimeException("I/O error autosaving world (message: " + e.getMessage() + ")", e);
                     }
@@ -3851,6 +3890,11 @@ public final class App extends JFrame implements BrushControl,
 
         menuItem = new JMenuItem(ACTION_SAVE_WORLD_AS);
         menuItem.setMnemonic('a');
+        menu.add(menuItem);
+
+        // Legacy escape hatch: same File menu, no accelerator (a power-user choice).
+        menuItem = new JMenuItem(ACTION_SAVE_WORLD_AS_LEGACY);
+        menuItem.setMnemonic('l');
         menu.add(menuItem);
 
         menuItem = new JMenuItem(ACTION_EXPORT_WORLD);
@@ -6076,10 +6120,28 @@ public final class App extends JFrame implements BrushControl,
             setAcceleratorKey(getKeyStroke(VK_S, PLATFORM_COMMAND_MASK | SHIFT_DOWN_MASK));
             setShortDescription(strings.getString("save.the.world.as.a.worldpainter.file"));
         }
-        
+
         @Override
         public void performAction(ActionEvent e) {
             saveAs();
+        }
+    };
+
+    /**
+     * Save-as in the legacy GZIP single-stream format (the only format prior to 2.27). Hidden in
+     * its own menu item rather than mixed into {@link #ACTION_SAVE_WORLD_AS} because the
+     * compartmentalised ZIP is the format we want users to default to — the escape hatch is for
+     * sharing files with older WorldPainter installs or for diagnosing a suspect new-format save.
+     * Same {@code .world} extension on disk; loaders disambiguate via magic bytes.
+     */
+    private final BetterAction ACTION_SAVE_WORLD_AS_LEGACY = new BetterAction("saveWorldAsLegacy", "Save World As (Legacy Format)...", ICON_SAVE_WORLD, false) {
+        {
+            setShortDescription("Save the world as a WorldPainter file in the pre-2.27 (legacy GZIP) format. Use this only if you need to share the file with an older WorldPainter.");
+        }
+
+        @Override
+        public void performAction(ActionEvent e) {
+            saveAsLegacy();
         }
     };
     
