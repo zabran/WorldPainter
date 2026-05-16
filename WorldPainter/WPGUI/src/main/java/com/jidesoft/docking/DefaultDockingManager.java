@@ -194,27 +194,42 @@ public class DefaultDockingManager implements DockingManager {
 
         // ----- JIDE-import fast path (must run BEFORE the initial layout deploys) -------------
         // A release-WP user's config carries layout bytes in the proprietary JIDE Docking
-        // Framework binary format. We extract the panel→side+index mapping and write it back
-        // onto each DockableFrame's initSide/initIndex *before* deployInitialLayout reads
-        // those fields. The deploy then arranges the panels exactly as release WP had them,
-        // with no need to redeploy afterwards. JideLayoutImporter returns false if the bytes
-        // don't look like JIDE format — we then fall through to the DockingFrames path. The
-        // import only runs when the layout hasn't been deployed yet (i.e. first launch of the
-        // app); for subsequent per-dimension layout loads after deployment, it's the
-        // DockingFrames CControl.read path that does the work.
+        // Framework binary format. We extract:
+        //   - panel → (side, index) — wired pre-deploy via DockableFrame.set{InitSide,InitIndex}
+        //   - panel → mode (DOCKED/AUTOHIDE/FLOATING) — applied post-deploy via setExtendedMode
+        // For subsequent per-dimension layout loads after deployment, it's the DockingFrames
+        // CControl.read path that takes over.
         if (!layoutDeployed) {
+            java.util.Map<String, JideLayoutImporter.FramePlacement> jidePlacements = null;
             try {
-                if (JideLayoutImporter.tryImport(bytes, frames)) {
-                    logger.info("Restored panel arrangement from JIDE-format layout bytes.");
-                    deployInitialLayout();
-                    return;
+                jidePlacements = JideLayoutImporter.tryParse(bytes);
+                if (jidePlacements != null) {
+                    // (a) Write (side, index) onto each frame's init fields BEFORE deploy.
+                    int applied = 0;
+                    for (java.util.Map.Entry<String, JideLayoutImporter.FramePlacement> e : jidePlacements.entrySet()) {
+                        final DockableFrame f = frames.get(e.getKey());
+                        if (f != null) {
+                            f.setInitSide(e.getValue().toDockContextSide());
+                            f.setInitIndex(e.getValue().index);
+                            applied++;
+                        }
+                    }
+                    logger.info("Restoring layout from JIDE bytes — applied {} of {} placement(s).",
+                            applied, jidePlacements.size());
                 }
             } catch (RuntimeException e) {
-                logger.warn("JIDE-import attempt threw; falling back to DockingFrames decode.", e);
+                logger.warn("JIDE-import parse threw; falling back to DockingFrames decode.", e);
+                jidePlacements = null;
             }
-            // Not JIDE (or import wasn't applicable) — let the deploy happen with the
-            // built-in DockableFrameBuilder defaults, then try CControl.read.
+
             deployInitialLayout();
+
+            // (b) Apply modes (AUTOHIDE / FLOATING) to dockables now that they exist. These
+            // calls are no-ops for panels we want to stay DOCKED (the default after deploy).
+            if (jidePlacements != null) {
+                applyJideModesPostDeploy(jidePlacements);
+                return; // skip CControl.read — we've placed everything from the JIDE bytes
+            }
         }
 
         try (DataInputStream dis = new DataInputStream(new java.io.ByteArrayInputStream(bytes))) {
@@ -223,6 +238,56 @@ public class DefaultDockingManager implements DockingManager {
             logger.info("Layout bytes weren't a DockingFrames CControl.write — using whatever's deployed. ({})",
                     e.toString());
         }
+    }
+
+    /**
+     * Translate each JIDE-imported {@code mode} (FLOATING / AUTOHIDE / DOCKED) into the
+     * DockingFrames-equivalent {@link bibliothek.gui.dock.common.mode.ExtendedMode} and apply
+     * it. Called immediately after {@link #deployInitialLayout} when we know the bytes were in
+     * JIDE format. Idempotent: DOCKED panels stay {@code NORMALIZED} (the default), AUTOHIDE
+     * panels become {@code MINIMIZED}, FLOATING panels become {@code EXTERNALIZED}.
+     *
+     * <p>The mode-set may fail per-panel for reasons we can't influence here (panel removed,
+     * mode unavailable in the current view); we log and skip. Failures are non-fatal — at worst
+     * the panel stays in its NORMALIZED dock position, which is the same fallback the user
+     * would see if they'd never run release WP at all.
+     *
+     * <p>Floating-group reconstruction (multiple panels in one external window via
+     * {@code groupMemberIds}) is a TODO — for now each FLOATING panel gets its own external
+     * window, which is functionally correct (the right panels become external) just visually
+     * less compact than what release WP showed.
+     */
+    private void applyJideModesPostDeploy(java.util.Map<String, JideLayoutImporter.FramePlacement> placements) {
+        int minimized = 0, externalized = 0, skipped = 0;
+        for (java.util.Map.Entry<String, JideLayoutImporter.FramePlacement> e : placements.entrySet()) {
+            final bibliothek.gui.dock.common.intern.DefaultCommonDockable ignored = null;
+            final bibliothek.gui.dock.common.DefaultSingleCDockable d = dockables.get(e.getKey());
+            if (d == null) {
+                continue; // unknown panel key; harmless
+            }
+            try {
+                switch (e.getValue().mode) {
+                    case JideLayoutImporter.MODE_AUTOHIDE:
+                        d.setExtendedMode(bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED);
+                        minimized++;
+                        break;
+                    case JideLayoutImporter.MODE_FLOATING:
+                        d.setExtendedMode(bibliothek.gui.dock.common.mode.ExtendedMode.EXTERNALIZED);
+                        externalized++;
+                        break;
+                    case JideLayoutImporter.MODE_DOCKED:
+                    default:
+                        // Already NORMALIZED from the deploy — nothing to do.
+                        break;
+                }
+            } catch (RuntimeException ex) {
+                logger.debug("Could not apply JIDE mode {} to '{}': {}",
+                        e.getValue().mode, e.getKey(), ex.toString());
+                skipped++;
+            }
+        }
+        logger.info("JIDE mode application: {} minimized, {} externalized, {} skipped",
+                minimized, externalized, skipped);
     }
 
     @Override

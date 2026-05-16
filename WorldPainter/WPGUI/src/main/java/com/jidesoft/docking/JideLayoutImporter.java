@@ -58,13 +58,41 @@ public final class JideLayoutImporter {
     private static final int JIDE_SIDE_WEST   = 8;
     private static final int JIDE_SIDE_CENTER = 16;
 
-    /** Carrier for what we extract per panel: dock side (JIDE bitmask) and index in that side. */
+    // The "current state" enum stored at offset +24 from each panel-id (NOT a JIDE constant —
+    // this is the JIDE-layout-file's own encoding, derived empirically from a real 2.26.1 save
+    // cross-checked against the user's visible layout):
+    //   1 = FLOATING, 2 = AUTOHIDE, 4 = DOCKED
+    public static final int MODE_FLOATING = 1;
+    public static final int MODE_AUTOHIDE = 2;
+    public static final int MODE_DOCKED   = 4;
+
+    // Floating-group marker found inside each panel record, followed by `int count` then
+    // `int[count]` of panel ids that share the floating window. Members include the panel's
+    // own id. Docked tab-stacks do NOT use this marker — they're inferred from matching
+    // (side, index) across panels.
+    private static final int GROUP_MARKER = 0xB850;
+
+    /** Carrier for what we extract per panel. */
     public static final class FramePlacement {
         public final int jideSide;
         public final int index;
-        FramePlacement(int jideSide, int index) {
+        /** {@link #MODE_FLOATING}, {@link #MODE_AUTOHIDE}, or {@link #MODE_DOCKED}. */
+        public final int mode;
+        /** The panel's own JIDE instance id (the "hash" field at offset +0 in its record). */
+        public final int id;
+        /**
+         * Member panel ids of this panel's floating group, including this panel itself. Only
+         * meaningful for {@code mode == MODE_FLOATING}; empty otherwise. The caller resolves
+         * these ids back to panel keys via {@link #findPanelKeyById}.
+         */
+        public final int[] groupMemberIds;
+
+        FramePlacement(int jideSide, int index, int mode, int id, int[] groupMemberIds) {
             this.jideSide = jideSide;
             this.index = index;
+            this.mode = mode;
+            this.id = id;
+            this.groupMemberIds = groupMemberIds != null ? groupMemberIds : new int[0];
         }
         /** Translate the JIDE bitmask to our adapter's {@link DockContext} constant. */
         public int toDockContextSide() {
@@ -115,42 +143,65 @@ public final class JideLayoutImporter {
 
         // Walk the stream as a sequence of int32 BE values starting at offset 2. When we see an
         // int that looks like a UTF-16 BE string length (small, fits in remaining bytes, all
-        // subsequent chars are printable ASCII in the BMP), consume it as a panel key — and then
-        // read the next three ints as (id, dockSide, dockIndex). The remaining per-frame metadata
-        // is skipped by scanning forward for the next plausible string.
-        final Map<String, FramePlacement> placements = new LinkedHashMap<>();
+        // subsequent chars are printable ASCII in the BMP), consume it as a panel key and read
+        // the per-panel record that follows (see top-of-file format doc).
+        //
+        // Each record runs from one panel-key string up to (but not including) the next, so we
+        // bracket the search-for-group-marker scan by the offset of the next plausible string.
+        // First-pass scan: find every panel key + its byte offset.
+        final java.util.List<int[]> panelOffsets = new java.util.ArrayList<>(); // [keyOffset, keyLen]
+        final java.util.List<String> panelKeys = new java.util.ArrayList<>();
         int i = 2;
-        try {
-            while (i + 4 <= b.length) {
-                final int val = readIntBE(b, i);
-                if (looksLikeStringLength(b, i + 4, val)) {
-                    final String key = readUtf16BE(b, i + 4, val);
-                    i += 4 + 2 * val;
-                    // Need at least 3 more int32s for (id, side, index).
-                    if (i + 12 > b.length) {
-                        break;
-                    }
-                    final int id = readIntBE(b, i);
-                    final int side = readIntBE(b, i + 4);
-                    final int index = readIntBE(b, i + 8);
-                    if (isValidSide(side)) {
-                        placements.put(key, new FramePlacement(side, index));
-                        logger.debug("JIDE import: panel '{}' → side=0x{} index={} (id={})",
-                                key, Integer.toHexString(side), index, id);
-                    } else {
-                        // Mistaken string detection (or a panel-less header section we shouldn't
-                        // have entered). Skip the three trailing ints and continue.
-                        logger.debug("JIDE import: '{}' had unexpected side value {}, skipping",
-                                key, side);
-                    }
-                    i += 12; // past (id, side, index)
-                } else {
-                    i += 4;
-                }
+        while (i + 4 <= b.length) {
+            final int val = readIntBE(b, i);
+            if (looksLikeStringLength(b, i + 4, val)) {
+                panelOffsets.add(new int[]{i, val});
+                panelKeys.add(readUtf16BE(b, i + 4, val));
+                i += 4 + 2 * val;
+            } else {
+                i += 4;
             }
-        } catch (RuntimeException e) {
-            logger.warn("JIDE import: parser threw at offset 0x{} — keeping the {} placement(s) we did extract",
-                    Integer.toHexString(i), placements.size(), e);
+        }
+
+        final Map<String, FramePlacement> placements = new LinkedHashMap<>();
+        for (int p = 0; p < panelKeys.size(); p++) {
+            final int keyOff = panelOffsets.get(p)[0];
+            final int keyLen = panelOffsets.get(p)[1];
+            final int idOff = keyOff + 4 + 2 * keyLen; // first byte after the UTF-16 chars
+            // Bound the search to the next panel's key offset (or end of file).
+            final int nextPanelKeyOff = (p + 1 < panelOffsets.size())
+                    ? panelOffsets.get(p + 1)[0]
+                    : b.length;
+
+            if (idOff + 28 > b.length) continue;
+            final int id        = readIntBE(b, idOff);
+            final int side      = readIntBE(b, idOff + 4);
+            final int index     = readIntBE(b, idOff + 8);
+            // idOff+12 = flag1 (skipped)
+            // idOff+16 = buttons (always 0x0F)
+            // idOff+20 = numModes? (always 4)
+            final int mode      = readIntBE(b, idOff + 24);
+
+            if (!isValidSide(side)) {
+                logger.debug("JIDE import: '{}' has unexpected side value {}, skipping",
+                        panelKeys.get(p), side);
+                continue;
+            }
+            if (!isValidMode(mode)) {
+                logger.debug("JIDE import: '{}' has unexpected mode value {}, treating as DOCKED",
+                        panelKeys.get(p), mode);
+            }
+
+            // Scan within this panel's record for the FIRST 0xB850 group marker. If found,
+            // the next int is the count, followed by `count` member ids.
+            final int[] groupIds = findGroupMembers(b, idOff + 28, nextPanelKeyOff);
+
+            placements.put(panelKeys.get(p), new FramePlacement(side, index,
+                    isValidMode(mode) ? mode : MODE_DOCKED, id, groupIds));
+            logger.debug("JIDE import: '{}' → side=0x{} index={} mode={} id=0x{} group={}",
+                    panelKeys.get(p), Integer.toHexString(side), index,
+                    modeName(isValidMode(mode) ? mode : MODE_DOCKED),
+                    Integer.toHexString(id), java.util.Arrays.toString(groupIds));
         }
 
         if (placements.isEmpty()) {
@@ -184,6 +235,51 @@ public final class JideLayoutImporter {
         }
         logger.info("JIDE import: applied {} placement(s) (out of {} parsed)", applied, placements.size());
         return applied > 0;
+    }
+
+    /**
+     * Find the first {@code 0xB850} group marker within the panel-record's byte range and read
+     * the {@code (count, id[count])} that follows it. Returns the id list, including the
+     * panel's own id (it always appears in its own group). For panels not in any group (e.g.
+     * DOCKED tab-stacks, which use shared (side, index) rather than the marker), returns an
+     * empty array.
+     */
+    private static int[] findGroupMembers(byte[] b, int searchStart, int searchEnd) {
+        final int safeEnd = Math.min(searchEnd, b.length);
+        for (int off = searchStart; off + 8 <= safeEnd; off += 4) {
+            if (readIntBE(b, off) == GROUP_MARKER) {
+                final int count = readIntBE(b, off + 4);
+                if (count >= 1 && count <= 32 && off + 8 + 4 * count <= safeEnd) {
+                    final int[] ids = new int[count];
+                    for (int k = 0; k < count; k++) {
+                        ids[k] = readIntBE(b, off + 8 + 4 * k);
+                    }
+                    return ids;
+                }
+            }
+        }
+        return new int[0];
+    }
+
+    /** Resolve a JIDE panel instance-id back to the panel key, by scanning all placements. */
+    public static String findPanelKeyById(Map<String, FramePlacement> placements, int id) {
+        for (Map.Entry<String, FramePlacement> e : placements.entrySet()) {
+            if (e.getValue().id == id) return e.getKey();
+        }
+        return null;
+    }
+
+    private static boolean isValidMode(int m) {
+        return m == MODE_FLOATING || m == MODE_AUTOHIDE || m == MODE_DOCKED;
+    }
+
+    private static String modeName(int m) {
+        switch (m) {
+            case MODE_FLOATING: return "FLOATING";
+            case MODE_AUTOHIDE: return "AUTOHIDE";
+            case MODE_DOCKED:   return "DOCKED";
+            default:            return "?(" + m + ")";
+        }
     }
 
     // ---- helpers ----------------------------------------------------------------------------
