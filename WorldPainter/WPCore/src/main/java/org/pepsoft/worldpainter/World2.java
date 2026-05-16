@@ -588,6 +588,21 @@ public class World2 extends InstanceKeeper implements Serializable, Cloneable {
         return MemoryUtils.getSize(this, new HashSet<>(Arrays.asList(UndoManager.class, Dimension.Listener.class, PropertyChangeSupport.class, Layer.class, Terrain.class)));
     }
 
+    /**
+     * Restore a {@link Dimension} read from a compartmentalised save ZIP into this world's
+     * dimension table. Used by {@link WorldIO#loadCompartmentalised(java.io.File)} after each
+     * {@code dim-data.bin} entry has been deserialised and re-linked to its world. This is the
+     * load-time inverse of the {@code dimensionsByAnchor = null} trick in {@link #save}: putting
+     * the dim straight into the map without the side-effects of {@link #addDimension} (which
+     * records a HistoryEntry and re-applies generator heuristics — wrong during load).
+     */
+    void attachDimensionFromLoad(Dimension dimension) {
+        if (dimension.getWorld() != this) {
+            throw new IllegalArgumentException("Dimension's world ref must be set to this World2 first");
+        }
+        dimensionsByAnchor.put(dimension.getAnchor(), dimension);
+    }
+
     public synchronized void save(ZipOutputStream out) throws IOException {
         // First serialise everything but the dimensions to a separate file
         out.putNextEntry(new ZipEntry("world-data.bin"));

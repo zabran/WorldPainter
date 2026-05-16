@@ -100,23 +100,45 @@ public class WorldFileSmokeTest extends AbstractTool {
         }
         logger.info("Legacy round-trip: PASSED");
 
-        // -------- 4. Probe compartmentalised ZIP save (existing path; known-suspect) --------
-        // Note: this is the path Marek wants to become the default in upcoming work (A2). It currently
-        // contains a latent bug — Dimension.save(ZipOutputStream) nulls `tiles` and then triggers
-        // Dimension.writeObject() which calls prepareForSaving() → ensureAllReadable() → NPE on the
-        // now-null tiles map. Caught and reported here so the smoke test still reports a pass when
-        // the legacy path works.
-        final File zipOut = File.createTempFile("wp-smoke-zip-", ".world.zip");
-        zipOut.deleteOnExit();
+        // -------- 4. Compartmentalised ZIP save + round-trip --------
+        // This is the new format Marek wants to become the default (A2). Save it next to the
+        // input file with a stable name so each run overwrites and the artifact is inspectable
+        // (unzip -l ..., diff ZIP entries between runs).
+        final File zipOut = new File(inFile.getParentFile(),
+                inFile.getName().replaceFirst("\\.world$", "") + "-smoke.world.zip");
+        if (zipOut.exists()) {
+            zipOut.delete();
+        }
         final long zipSaveStart = System.currentTimeMillis();
         try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(zipOut), 1 << 20)) {
             new WorldIO(world).saveCompartmentalised(out);
-            final long zipSaveMs = System.currentTimeMillis() - zipSaveStart;
-            logger.info("Compartmentalised ZIP save: {} ms ({} bytes)", zipSaveMs, zipOut.length());
-        } catch (RuntimeException | IOException e) {
-            logger.warn("Compartmentalised ZIP save FAILED (pre-existing bug; out of scope for this test): {}: {}",
-                    e.getClass().getSimpleName(), e.getMessage());
         }
+        final long zipSaveMs = System.currentTimeMillis() - zipSaveStart;
+        logger.info("Compartmentalised ZIP save: {} ms ({} bytes) -> {}",
+                zipSaveMs, zipOut.length(), zipOut.getAbsolutePath());
+
+        // -------- 5. Re-load from ZIP — the new round-trip test --------
+        final long zipReloadStart = System.currentTimeMillis();
+        final WorldIO zipReloader = new WorldIO();
+        zipReloader.loadCompartmentalised(zipOut);
+        final long zipReloadMs = System.currentTimeMillis() - zipReloadStart;
+        final World2 zipReloaded = zipReloader.getWorld();
+        int zipReloadedTiles = 0;
+        for (Dimension dim : zipReloaded.getDimensions()) {
+            zipReloadedTiles += dim.getTileCount();
+        }
+        logger.info("Re-load of compartmentalised save: {} ms (tiles: {} — expected {})",
+                zipReloadMs, zipReloadedTiles, totalTiles);
+        if (zipReloadedTiles != totalTiles) {
+            logger.error("ZIP ROUND-TRIP FAILED: tile count mismatch");
+            System.exit(4);
+        }
+        if (zipReloaded.getDimensions().size() != dimensions.size()) {
+            logger.error("ZIP ROUND-TRIP FAILED: dimension count mismatch ({} vs {})",
+                    zipReloaded.getDimensions().size(), dimensions.size());
+            System.exit(4);
+        }
+        logger.info("Compartmentalised round-trip: PASSED");
 
         // -------- 5. PR #478 microbenchmark --------
         runPr478Benchmark();

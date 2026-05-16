@@ -1923,7 +1923,13 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
 
     synchronized void ensureAllReadable() {
         ensureManagedAttributesReadable();
-        tiles.values().forEach(Tile::ensureAllReadable);
+        // Compartmentalised save (save(ZipOutputStream)) deliberately nulls `tiles` so they're
+        // not included in the dim-data.bin ZIP entry — they're streamed separately, region by
+        // region. The ensuing writeObject() hook still fires prepareForSaving() → ensureAllReadable(),
+        // so we have to tolerate the transient null here. Managed-attributes path still runs.
+        if (tiles != null) {
+            tiles.values().forEach(Tile::ensureAllReadable);
+        }
     }
 
     public void addDimensionListener(Listener listener) {
@@ -2272,6 +2278,47 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             }
         }
         return mostPrevalentBiome;
+    }
+
+    /**
+     * Set this dimension's parent {@link World2} reference. Used by
+     * {@link WorldIO#loadCompartmentalised(java.io.File)} after {@code dim-data.bin} has been
+     * deserialised (which produces a Dimension with {@code world == null} because save's
+     * {@code dimensionsByAnchor = null} trick happens at the World2 level and tiles=null trick
+     * happens at the Dimension level). Must be called before
+     * {@link World2#attachDimensionFromLoad}.
+     */
+    void attachWorldFromLoad(World2 world) {
+        this.world = world;
+    }
+
+    /**
+     * Add a tile that has been read from a {@code region-data-x,y.bin} entry to this dimension's
+     * tile map and wire it up: listener attached, garden seeds bound to this dimension's garden.
+     * The bounding-box (lowestX/highestX/lowestY/highestY) and other dim-level state was already
+     * restored by {@link #readObject(java.io.ObjectInputStream)} on this Dimension; no further
+     * update is needed here. Used by {@link WorldIO#loadCompartmentalised(java.io.File)}.
+     *
+     * <p>Differs from {@link #addTile} in skipping {@code fireTileAdded}, {@code changeNo}
+     * bumping, and the bounding-box maintenance — none of which we want during a load: the world
+     * is not yet user-visible and the bounding box came off disk authoritative.
+     */
+    void attachTileFromLoad(Tile tile) {
+        if (tile.getMaxHeight() != maxHeight) {
+            throw new IllegalArgumentException("Tile has different max height (" + tile.getMaxHeight() + ") than dimension (" + maxHeight + ")");
+        }
+        final Point key = new Point(tile.getX(), tile.getY());
+        if (tiles.containsKey(key)) {
+            throw new IllegalStateException("Tile already loaded at " + key);
+        }
+        tiles.put(key, tile);
+        tile.addListener(this);
+        final Set<Seed> seeds = tile.getSeeds();
+        if (seeds != null) {
+            for (Seed gardenSeed : seeds) {
+                gardenSeed.garden = garden;
+            }
+        }
     }
 
     public void save(ZipOutputStream out) throws IOException {

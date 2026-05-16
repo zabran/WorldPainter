@@ -140,6 +140,153 @@ public class WorldIO {
         }
     }
 
+    /**
+     * Load a world from a {@code .world.zip} file previously written by
+     * {@link #saveCompartmentalised(OutputStream)}.
+     *
+     * <p>Layout (see {@link World2#save(ZipOutputStream)} and {@link Dimension#save(ZipOutputStream)}):
+     * <pre>
+     *   metadata.json                      — top-level metadata map (JSON)
+     *   world-data.bin                     — serialised World2 with dimensionsByAnchor=null
+     *   {anchor}/dim-data.bin              — serialised Dimension with tiles=null, world=null
+     *   {anchor}/region-data-{x},{y}.bin   — List&lt;Tile&gt; for one 4×4 region
+     * </pre>
+     * where {@code {anchor}} is the {@link Dimension.Anchor#toString()} form, e.g. {@code "0 DETAIL"}.
+     *
+     * <p>Uses {@link ZipFile} rather than {@code ZipInputStream} for two reasons: (1) random
+     * access lets us read {@code world-data.bin} first regardless of entry order, then walk per-dim
+     * entries; (2) avoids buffering the whole archive in memory — only one ZIP entry is open at
+     * a time. Caller is responsible for invoking via a {@code File}; {@link #load(InputStream)}
+     * will eventually dispatch here for inputs whose magic bytes identify them as ZIPs (see A1
+     * in the worldpainter.md plan).
+     *
+     * @param file The {@code .world.zip} file to load.
+     * @throws IOException If an I/O error occurred reading the archive.
+     * @throws UnloadableWorldException If the archive is structurally valid but logically wrong
+     *     (missing expected entries, wrong object types) or class versions don't match.
+     */
+    @SuppressWarnings("unchecked")
+    public void loadCompartmentalised(File file) throws IOException, UnloadableWorldException {
+        Map<String, Object> metadata = null;
+        world = null;
+        try (ZipFile zip = new ZipFile(file)) {
+            // 1. metadata.json (optional — old experimental saves might not have it)
+            final ZipEntry metaEntry = zip.getEntry("metadata.json");
+            if (metaEntry != null) {
+                try (InputStream in = zip.getInputStream(metaEntry)) {
+                    metadata = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(in, Map.class);
+                }
+            }
+
+            // 2. world-data.bin → World2. After deserialisation `dimensionsByAnchor` is empty
+            // (World2.readObject creates a fresh HashMap when the field is null on disk).
+            final ZipEntry worldEntry = zip.getEntry("world-data.bin");
+            if (worldEntry == null) {
+                throw new UnloadableWorldException("Compartmentalised archive missing world-data.bin entry", metadata);
+            }
+            try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(
+                    zip.getInputStream(worldEntry),
+                    PluginManager.getPluginClassLoader(),
+                    AbstractObject.class)) {
+                final Object obj = wrappedIn.readObject();
+                if (obj instanceof World2) {
+                    world = (World2) obj;
+                } else {
+                    throw new UnloadableWorldException(
+                            "world-data.bin contains object of unexpected type " + obj.getClass(),
+                            metadata);
+                }
+            }
+
+            // 3. Group remaining entries by dimension prefix.
+            final Map<String, List<ZipEntry>> regionEntriesByPrefix = new HashMap<>();
+            final Map<String, ZipEntry> dimEntryByPrefix = new HashMap<>();
+            final Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                final ZipEntry e = entries.nextElement();
+                final String name = e.getName();
+                final int slash = name.indexOf('/');
+                if (slash <= 0) {
+                    continue; // top-level entry already handled or unknown
+                }
+                final String prefix = name.substring(0, slash);
+                final String rest = name.substring(slash + 1);
+                if (rest.equals("dim-data.bin")) {
+                    dimEntryByPrefix.put(prefix, e);
+                } else if (rest.startsWith("region-data-")) {
+                    regionEntriesByPrefix.computeIfAbsent(prefix, k -> new ArrayList<>()).add(e);
+                }
+            }
+
+            // 4. Materialise each dimension and merge its tiles back in.
+            for (Map.Entry<String, ZipEntry> dimEnt : dimEntryByPrefix.entrySet()) {
+                final String prefix = dimEnt.getKey();
+                final Dimension dim;
+                try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(
+                        zip.getInputStream(dimEnt.getValue()),
+                        PluginManager.getPluginClassLoader(),
+                        AbstractObject.class)) {
+                    final Object obj = wrappedIn.readObject();
+                    if (obj instanceof Dimension) {
+                        dim = (Dimension) obj;
+                    } else {
+                        throw new UnloadableWorldException(
+                                prefix + "/dim-data.bin contains object of unexpected type " + obj.getClass(),
+                                metadata);
+                    }
+                }
+
+                // Sanity-check that the entry-name anchor and the deserialised anchor agree.
+                // Defensive — catches a malformed/corrupted archive early rather than silently
+                // attaching a Surface dim to the End slot.
+                final Dimension.Anchor expectedAnchor;
+                try {
+                    expectedAnchor = Dimension.Anchor.fromString(prefix);
+                } catch (RuntimeException e) {
+                    throw new UnloadableWorldException(
+                            "Cannot parse dimension anchor from entry path '" + prefix + "'",
+                            e, metadata);
+                }
+                if (! expectedAnchor.equals(dim.getAnchor())) {
+                    throw new UnloadableWorldException(
+                            "Anchor mismatch in '" + prefix + "': dim-data.bin has " + dim.getAnchor()
+                                    + " but path prefix implies " + expectedAnchor,
+                            metadata);
+                }
+
+                // Re-link world ↔ dim.
+                dim.attachWorldFromLoad(world);
+                world.attachDimensionFromLoad(dim);
+
+                // Pull in this dimension's regions.
+                final List<ZipEntry> regionEntries = regionEntriesByPrefix.getOrDefault(prefix, List.of());
+                for (ZipEntry regionEntry : regionEntries) {
+                    try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(
+                            zip.getInputStream(regionEntry),
+                            PluginManager.getPluginClassLoader(),
+                            AbstractObject.class)) {
+                        final Object obj = wrappedIn.readObject();
+                        if (! (obj instanceof List)) {
+                            throw new UnloadableWorldException(
+                                    regionEntry.getName() + " contains object of unexpected type " + obj.getClass(),
+                                    metadata);
+                        }
+                        final List<Tile> tileList = (List<Tile>) obj;
+                        for (Tile tile : tileList) {
+                            dim.attachTileFromLoad(tile);
+                        }
+                    }
+                }
+            }
+        } catch (ZipException | StreamCorruptedException | IllegalArgumentException | ClassNotFoundException | InvalidClassException | EOFException e) {
+            throw new UnloadableWorldException(e.getClass().getSimpleName() + " while loading world", e, metadata);
+        }
+        if (metadata != null) {
+            world.setMetadata(metadata);
+        }
+    }
+
     @NotNull
     private Map<String, Object> getMetadata() {
         final Map<String, Object> metadata = new HashMap<>();
