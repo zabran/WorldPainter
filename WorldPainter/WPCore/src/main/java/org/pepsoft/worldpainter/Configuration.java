@@ -551,6 +551,28 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
         this.jideLayoutData = jideLayoutData;
     }
 
+    // --- DockingFrames layout (added by Marek's fork, parallel to the JIDE fields above) -------
+    // Same shape as the JIDE pair, but holds bytes produced by DockingFrames' CControl.write
+    // rather than the proprietary JIDE format. They live in separate fields so the JIDE bytes
+    // saved by release WP stay readable when the user goes back to release WP — neither tool
+    // stomps the other's docking state. See App.java's load/save sites.
+
+    public synchronized byte[] getDefaultDockingFramesLayoutData() {
+        return defaultDockingFramesLayoutData;
+    }
+
+    public synchronized void setDefaultDockingFramesLayoutData(byte[] data) {
+        this.defaultDockingFramesLayoutData = data;
+    }
+
+    public synchronized Map<String, byte[]> getDockingFramesLayoutData() {
+        return dockingFramesLayoutData;
+    }
+
+    public synchronized void setDockingFramesLayoutData(Map<String, byte[]> data) {
+        this.dockingFramesLayoutData = data;
+    }
+
     public synchronized LookAndFeel getLookAndFeel() {
         return lookAndFeel;
     }
@@ -1389,6 +1411,10 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
     private String defaultGeneratorOptions;
     private byte[] defaultJideLayoutData;
     private Map<String, byte[]> jideLayoutData;
+    // Added by Marek's fork — see the accessor block above for the rationale (separate fields
+    // so JIDE bytes saved by release WP coexist with our DockingFrames bytes).
+    private byte[] defaultDockingFramesLayoutData;
+    private Map<String, byte[]> dockingFramesLayoutData;
     private LookAndFeel lookAndFeel;
     private OverlayType overlayType = OverlayType.OPTIMISE_ON_LOAD;
     private int showCalloutCount = 3;

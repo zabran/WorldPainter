@@ -461,12 +461,15 @@ public final class App extends JFrame implements BrushControl,
                 currentUndoManager = null;
             }
 
-            Map<String, byte[]> layoutData = config.getJideLayoutData();
+            // Persist this dimension's DockingFrames layout in the per-dim map. We write to the
+            // dockingFramesLayoutData field, *not* the older jideLayoutData field — so any JIDE
+            // bytes a release-WP install previously wrote stay readable by release WP.
+            Map<String, byte[]> layoutData = config.getDockingFramesLayoutData();
             if (layoutData == null) {
                 layoutData = new HashMap<>();
             }
             layoutData.put(this.dimension.getId().toString(), dockingManager.getLayoutRawData());
-            config.setJideLayoutData(layoutData);
+            config.setDockingFramesLayoutData(layoutData);
 
             // Remove the existing custom object layers and save the list of custom layers to the dimension to preserve
             // layers which aren't currently in use
@@ -672,7 +675,10 @@ public final class App extends JFrame implements BrushControl,
             updateZoomLabel();
             updateRadiusLabel();
 
-            final Map<String, byte[]> layoutData = config.getJideLayoutData();
+            // Restore the saved DockingFrames layout for this dimension (if any). The separate
+            // dockingFramesLayoutData field keeps our state independent of release WP's JIDE
+            // bytes — see the writer at App.java's earlier dim-switch site.
+            final Map<String, byte[]> layoutData = config.getDockingFramesLayoutData();
             final String key = dimension.getId().toString();
             if ((layoutData != null) && layoutData.containsKey(key)) {
                 dockingManager.loadLayoutFrom(new ByteArrayInputStream(layoutData.get(key)));
@@ -2397,12 +2403,12 @@ public final class App extends JFrame implements BrushControl,
                             throw new IOException("Could not move " + tempFile.getName() + " to " + normalisedFile.getName() + "; world is saved as " + tempFile.getName());
                         }
 
-                        Map<String, byte[]> layoutData = config.getJideLayoutData();
+                        Map<String, byte[]> layoutData = config.getDockingFramesLayoutData();
                         if (layoutData == null) {
                             layoutData = new HashMap<>();
                         }
                         layoutData.put(dimension.getId().toString(), dockingManager.getLayoutRawData());
-                        config.setJideLayoutData(layoutData);
+                        config.setDockingFramesLayoutData(layoutData);
 
                         return null;
                     } catch (IOException e) {
@@ -2802,8 +2808,8 @@ public final class App extends JFrame implements BrushControl,
         infoPanel = createInfoPanel();
         dockingManager.addFrame(new DockableFrameBuilder(infoPanel, "Info", DOCK_SIDE_EAST, 2).withId("infoPanel").expand().withIcon(loadScaledIcon("information")).build());
 
-        if (config.getDefaultJideLayoutData() != null) {
-            dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultJideLayoutData()));
+        if (config.getDefaultDockingFramesLayoutData() != null) {
+            dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultDockingFramesLayoutData()));
         } else {
             dockingManager.resetToDefault();
         }
@@ -4259,7 +4265,7 @@ public final class App extends JFrame implements BrushControl,
         menuItem.setMnemonic('a');
         workspaceLayoutMenu.add(menuItem);
 
-        ACTION_LOAD_LAYOUT.setEnabled(config.getDefaultJideLayoutData() != null);
+        ACTION_LOAD_LAYOUT.setEnabled(config.getDefaultDockingFramesLayoutData() != null);
         menuItem = new JMenuItem(ACTION_LOAD_LAYOUT);
         menuItem.setMnemonic('l');
         workspaceLayoutMenu.add(menuItem);
@@ -6660,7 +6666,9 @@ public final class App extends JFrame implements BrushControl,
             if (JOptionPane.showConfirmDialog(App.this, "Are you sure you want to reset the workspace?", "Confirm Workspace Reset", YES_NO_OPTION) == YES_OPTION) {
                 dockingManager.resetToDefault();
                 Configuration config = Configuration.getInstance();
-                config.setDefaultJideLayoutData(null);
+                // Clear OUR DockingFrames layout. We deliberately don't touch the older JIDE
+                // bytes — those belong to release WP and are none of our business.
+                config.setDefaultDockingFramesLayoutData(null);
                 ACTION_LOAD_LAYOUT.setEnabled(false);
             }
         }
@@ -6673,8 +6681,8 @@ public final class App extends JFrame implements BrushControl,
             if (JOptionPane.showConfirmDialog(App.this, "Are you sure you want to reset the workspace for all worlds?", "Confirm Workspace Reset", YES_NO_OPTION) == YES_OPTION) {
                 dockingManager.resetToDefault();
                 Configuration config = Configuration.getInstance();
-                config.setDefaultJideLayoutData(null);
-                config.setJideLayoutData(null);
+                config.setDefaultDockingFramesLayoutData(null);
+                config.setDockingFramesLayoutData(null);
                 ACTION_LOAD_LAYOUT.setEnabled(false);
             }
         }
@@ -6684,8 +6692,8 @@ public final class App extends JFrame implements BrushControl,
         @Override
         protected void performAction(ActionEvent e) {
             Configuration config = Configuration.getInstance();
-            if (config.getDefaultJideLayoutData() != null) {
-                dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultJideLayoutData()));
+            if (config.getDefaultDockingFramesLayoutData() != null) {
+                dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultDockingFramesLayoutData()));
             }
         }
     };
@@ -6694,7 +6702,7 @@ public final class App extends JFrame implements BrushControl,
         @Override
         protected void performAction(ActionEvent e) {
             Configuration config = Configuration.getInstance();
-            config.setDefaultJideLayoutData(dockingManager.getLayoutRawData());
+            config.setDefaultDockingFramesLayoutData(dockingManager.getLayoutRawData());
             ACTION_LOAD_LAYOUT.setEnabled(true);
             showInfo(App.this, "Workspace layout saved", "Workspace layout saved");
         }
