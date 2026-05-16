@@ -1,6 +1,8 @@
 package org.pepsoft.worldpainter;
 
 import org.pepsoft.util.UnsafeRandom;
+import org.pepsoft.worldpainter.layers.CustomLayer;
+import org.pepsoft.worldpainter.layers.Layer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,6 +12,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 
@@ -140,6 +144,16 @@ public class WorldFileSmokeTest extends AbstractTool {
         }
         logger.info("Compartmentalised round-trip: PASSED");
 
+        // -------- 5b. A3 — Layer identity preserved across ZIP boundary --------
+        // Pre-A3: each ZIP entry was a fresh ObjectOutputStream, so the same CustomLayer ended up
+        // as a different Java object per region. Layer.equals is id-based so map lookups still
+        // worked, but identity-based code paths and post-load init() were silently duplicated.
+        // Post-A3: a single LayerRegistry (layers.bin entry) backs every reference. Assert that
+        // every Layer reachable from any reloaded tile is `==` to the canonical one in the
+        // dimension's customLayers list.
+        verifyLayerIdentityPreserved(zipReloaded);
+        logger.info("Layer identity across ZIP boundary: PASSED");
+
         // -------- 6. Verify magic-byte dispatch in load(File) --------
         // The whole point of A1 is that callers can hand the same File to load() and the right
         // path runs automatically. Round-trip both formats via load(File) and confirm tile counts.
@@ -240,6 +254,57 @@ public class WorldFileSmokeTest extends AbstractTool {
         logger.info("Speedup: {}× (UnsafeRandom.fastNextInt is {}% faster)",
                 String.format("%.2f", speedup), String.format("%.1f", pctFaster));
         logger.info("(blackhole: r={}, u={})", randomAcc, unsafeAcc);
+    }
+
+    /**
+     * Assert that A3's layer-deduplication actually delivers the property it advertises: every
+     * {@code Layer} reachable from any tile's {@code getLayers()} call must be the exact same
+     * Java object as the corresponding {@code CustomLayer} in the dimension's {@code customLayers}
+     * list. Equality alone isn't enough — {@link Layer#equals} is id-based and would have passed
+     * even when the format was producing duplicate Layer instances per region (which was the
+     * pre-A3 behaviour).
+     *
+     * <p>Built-in (non-custom) layers can also appear in tile data; for those, we just require
+     * that two tiles referencing the same built-in {@code Layer} (by id) get the <em>same</em>
+     * canonical instance — i.e., the canonical-instance count must match the unique-id count.
+     */
+    private static void verifyLayerIdentityPreserved(World2 world) {
+        // Build an identity map: layer-id -> first instance seen, plus a second map id -> set of
+        // distinct instances. If the registry is doing its job, every set is size 1.
+        final Map<String, IdentityHashMap<Layer, Boolean>> distinctInstancesById = new java.util.HashMap<>();
+        int tilesScanned = 0;
+        for (Dimension dim : world.getDimensions()) {
+            for (Tile tile : dim.getTiles()) {
+                for (Layer layer : tile.getLayers()) {
+                    distinctInstancesById
+                            .computeIfAbsent(layer.getId(), k -> new IdentityHashMap<>())
+                            .put(layer, Boolean.TRUE);
+                }
+                tilesScanned++;
+            }
+            // Also include the dim's custom-layer list — they must share identity with tile refs.
+            for (CustomLayer cl : dim.getCustomLayers()) {
+                distinctInstancesById
+                        .computeIfAbsent(cl.getId(), k -> new IdentityHashMap<>())
+                        .put(cl, Boolean.TRUE);
+            }
+        }
+        int duplicated = 0, uniqueIds = 0, totalInstances = 0;
+        for (Map.Entry<String, IdentityHashMap<Layer, Boolean>> e : distinctInstancesById.entrySet()) {
+            uniqueIds++;
+            final int n = e.getValue().size();
+            totalInstances += n;
+            if (n > 1) {
+                duplicated++;
+                logger.error("Layer id '{}' has {} distinct Java instances after load", e.getKey(), n);
+            }
+        }
+        logger.info("Layer identity scan: {} tiles, {} unique layer ids, {} total instances",
+                tilesScanned, uniqueIds, totalInstances);
+        if (duplicated > 0) {
+            logger.error("A3 LAYER-IDENTITY FAILED: {} layer ids had >1 Java instance", duplicated);
+            System.exit(7);
+        }
     }
 
     private static long[] timeRandom(int iterations, int bound, long baseSeed) {

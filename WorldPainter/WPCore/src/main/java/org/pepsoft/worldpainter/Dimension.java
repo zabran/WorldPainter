@@ -2326,7 +2326,10 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
         try {
             setEventsInhibited(true);
             try {
-                // First serialise everything but the tiles to a separate file
+                // First serialise everything but the tiles to a separate file. See the comment in
+                // World2.save for what the CompartmentalisedSerialisation factory does — in short:
+                // when the caller has bound a LayerRegistry, the returned stream substitutes
+                // LayerRef placeholders for every Layer flowing through it.
                 final String path = anchor + "/";
                 out.putNextEntry(new ZipEntry(path + "dim-data.bin"));
                 try {
@@ -2335,7 +2338,7 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
                     try {
                         tiles = null;
                         world = null;
-                        final ObjectOutputStream dataout = new ObjectOutputStream(out);
+                        final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
                         dataout.writeObject(this);
                         dataout.flush();
                     } finally {
@@ -2363,7 +2366,7 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
 
                         out.putNextEntry(new ZipEntry(path + "region-data-" + regionX + "," + regionY + ".bin"));
                         try {
-                            final ObjectOutputStream dataout = new ObjectOutputStream(out);
+                            final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
                             dataout.writeObject(tileList);
                             dataout.flush();
                         } finally {

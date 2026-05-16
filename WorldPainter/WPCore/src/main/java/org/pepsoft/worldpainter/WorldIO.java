@@ -79,9 +79,24 @@ public class WorldIO {
      * @param out The stream to which to save the world.
      * @throws IOException If an I/O error occurred saving the world.
      */
-    // TODO this saves multiple copies of layers, etc.! Either solve that on loading, or else use this only for
-    //  exporting
+    /**
+     * Save the world in the compartmentalised ZIP format.
+     *
+     * <p>The {@code layers.bin} entry that's written here at the end of the archive is what makes
+     * the format correct under cross-entry layer references: every {@code Layer} referenced by
+     * {@code world-data.bin}, {@code dim-data.bin}, or any {@code region-data-X,Y.bin} entry is
+     * replaced inline with a {@link org.pepsoft.worldpainter.io.LayerRef}{@code (index)}, and the
+     * {@code layers.bin} entry holds the (index → Layer) registry. The substitution happens
+     * silently inside {@link CompartmentalisedSerialisation#newObjectOutputStream}, which is what
+     * the embedded {@link World2#save} / {@link Dimension#save} calls use to open their per-entry
+     * {@code ObjectOutputStream}s.
+     *
+     * <p>The registry has to be written <em>after</em> the data entries — we don't know which
+     * layers will be referenced until they've all been walked. Load works fine with the registry
+     * at the end because {@link ZipFile} indexes the central directory, not the entry order.
+     */
     public void saveCompartmentalised(OutputStream out) throws IOException {
+        final org.pepsoft.worldpainter.io.LayerRegistry registry = new org.pepsoft.worldpainter.io.LayerRegistry();
         try (ZipOutputStream wrappedOut = new ZipOutputStream(out)) {
             final ObjectMapper objectMapper = new ObjectMapper()
                     .disable(AUTO_CLOSE_TARGET)
@@ -92,7 +107,20 @@ public class WorldIO {
             } finally {
                 wrappedOut.closeEntry();
             }
-            world.save(wrappedOut);
+            org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withSaveBinding(registry, () -> {
+                world.save(wrappedOut);
+            });
+
+            // Now write the registry, using a plain stream — its contents *are* the Layer
+            // instances, so we don't want them to round-trip through LayerRef.
+            wrappedOut.putNextEntry(new ZipEntry("layers.bin"));
+            try {
+                final ObjectOutputStream layersOut = new ObjectOutputStream(wrappedOut);
+                layersOut.writeObject(registry);
+                layersOut.flush();
+            } finally {
+                wrappedOut.closeEntry();
+            }
         }
     }
 
@@ -252,123 +280,185 @@ public class WorldIO {
      */
     @SuppressWarnings("unchecked")
     public void loadCompartmentalised(File file) throws IOException, UnloadableWorldException {
-        Map<String, Object> metadata = null;
+        final Map<String, Object>[] metadataHolder = new Map[]{null};
         world = null;
         try (ZipFile zip = new ZipFile(file)) {
             // 1. metadata.json (optional — old experimental saves might not have it)
             final ZipEntry metaEntry = zip.getEntry("metadata.json");
             if (metaEntry != null) {
                 try (InputStream in = zip.getInputStream(metaEntry)) {
-                    metadata = new com.fasterxml.jackson.databind.ObjectMapper()
+                    metadataHolder[0] = new com.fasterxml.jackson.databind.ObjectMapper()
                             .readValue(in, Map.class);
                 }
             }
 
-            // 2. world-data.bin → World2. After deserialisation `dimensionsByAnchor` is empty
-            // (World2.readObject creates a fresh HashMap when the field is null on disk).
-            final ZipEntry worldEntry = zip.getEntry("world-data.bin");
-            if (worldEntry == null) {
-                throw new UnloadableWorldException("Compartmentalised archive missing world-data.bin entry", metadata);
+            // 2. layers.bin (optional — present in A3+ archives; older archives have embedded
+            //    Layer instances in each entry, which we read transparently with no binding).
+            final org.pepsoft.worldpainter.io.LayerRegistry registry;
+            final ZipEntry layersEntry = zip.getEntry("layers.bin");
+            if (layersEntry != null) {
+                try (ObjectInputStream layersIn = new WPCustomObjectInputStream(
+                        zip.getInputStream(layersEntry),
+                        PluginManager.getPluginClassLoader(),
+                        AbstractObject.class)) {
+                    final Object obj = layersIn.readObject();
+                    if (! (obj instanceof org.pepsoft.worldpainter.io.LayerRegistry)) {
+                        throw new UnloadableWorldException(
+                                "layers.bin contains object of unexpected type " + obj.getClass(),
+                                metadataHolder[0]);
+                    }
+                    registry = (org.pepsoft.worldpainter.io.LayerRegistry) obj;
+                }
+            } else {
+                registry = null;
             }
-            try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(
-                    zip.getInputStream(worldEntry),
+
+            // 3. Read everything else inside the registry binding (if any). Within the binding,
+            //    every Layer ref in the data entries is resolved to its canonical instance from
+            //    the registry. Without the binding (pre-A3 archives), Layer instances were
+            //    serialised embedded — those still work, just without cross-entry identity.
+            final Map<String, Object> finalMetadata = metadataHolder[0];
+            if (registry != null) {
+                org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withLoadBinding(
+                        registry,
+                        () -> {
+                            try {
+                                readWorldAndRegions(zip, finalMetadata);
+                            } catch (UnloadableWorldException e) {
+                                // Sneaky-throw out of the IOAction lambda — withLoadBinding only
+                                // declares IOException, but the body legitimately needs to throw
+                                // UnloadableWorldException too. Wrap-and-unwrap pattern.
+                                throw new WrappedUnloadable(e);
+                            }
+                        });
+            } else {
+                readWorldAndRegions(zip, finalMetadata);
+            }
+        } catch (WrappedUnloadable e) {
+            throw e.original;
+        } catch (ZipException | StreamCorruptedException | IllegalArgumentException | ClassNotFoundException | InvalidClassException | EOFException e) {
+            throw new UnloadableWorldException(e.getClass().getSimpleName() + " while loading world", e, metadataHolder[0]);
+        }
+        if (metadataHolder[0] != null) {
+            world.setMetadata(metadataHolder[0]);
+        }
+    }
+
+    /**
+     * The body of {@link #loadCompartmentalised} after the registry has been resolved. Pulled
+     * into a method so it can run both directly (no registry / pre-A3 archive) and inside the
+     * registry binding (A3+ archives), without duplicating logic.
+     */
+    @SuppressWarnings("unchecked")
+    private void readWorldAndRegions(ZipFile zip, Map<String, Object> metadata)
+            throws IOException, UnloadableWorldException, ClassNotFoundException {
+        // world-data.bin → World2
+        final ZipEntry worldEntry = zip.getEntry("world-data.bin");
+        if (worldEntry == null) {
+            throw new UnloadableWorldException("Compartmentalised archive missing world-data.bin entry", metadata);
+        }
+        try (WPCustomObjectInputStream wrappedIn = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectInputStream(
+                zip.getInputStream(worldEntry),
+                PluginManager.getPluginClassLoader(),
+                AbstractObject.class)) {
+            final Object obj = wrappedIn.readObject();
+            if (obj instanceof World2) {
+                world = (World2) obj;
+            } else {
+                throw new UnloadableWorldException(
+                        "world-data.bin contains object of unexpected type " + obj.getClass(),
+                        metadata);
+            }
+        }
+
+        // Group remaining entries by dimension prefix.
+        final Map<String, List<ZipEntry>> regionEntriesByPrefix = new HashMap<>();
+        final Map<String, ZipEntry> dimEntryByPrefix = new HashMap<>();
+        final Enumeration<? extends ZipEntry> entries = zip.entries();
+        while (entries.hasMoreElements()) {
+            final ZipEntry e = entries.nextElement();
+            final String name = e.getName();
+            final int slash = name.indexOf('/');
+            if (slash <= 0) {
+                continue;
+            }
+            final String prefix = name.substring(0, slash);
+            final String rest = name.substring(slash + 1);
+            if (rest.equals("dim-data.bin")) {
+                dimEntryByPrefix.put(prefix, e);
+            } else if (rest.startsWith("region-data-")) {
+                regionEntriesByPrefix.computeIfAbsent(prefix, k -> new ArrayList<>()).add(e);
+            }
+        }
+
+        // Materialise each dimension and merge its tiles back in.
+        for (Map.Entry<String, ZipEntry> dimEnt : dimEntryByPrefix.entrySet()) {
+            final String prefix = dimEnt.getKey();
+            final Dimension dim;
+            try (WPCustomObjectInputStream wrappedIn = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectInputStream(
+                    zip.getInputStream(dimEnt.getValue()),
                     PluginManager.getPluginClassLoader(),
                     AbstractObject.class)) {
                 final Object obj = wrappedIn.readObject();
-                if (obj instanceof World2) {
-                    world = (World2) obj;
+                if (obj instanceof Dimension) {
+                    dim = (Dimension) obj;
                 } else {
                     throw new UnloadableWorldException(
-                            "world-data.bin contains object of unexpected type " + obj.getClass(),
+                            prefix + "/dim-data.bin contains object of unexpected type " + obj.getClass(),
                             metadata);
                 }
             }
 
-            // 3. Group remaining entries by dimension prefix.
-            final Map<String, List<ZipEntry>> regionEntriesByPrefix = new HashMap<>();
-            final Map<String, ZipEntry> dimEntryByPrefix = new HashMap<>();
-            final Enumeration<? extends ZipEntry> entries = zip.entries();
-            while (entries.hasMoreElements()) {
-                final ZipEntry e = entries.nextElement();
-                final String name = e.getName();
-                final int slash = name.indexOf('/');
-                if (slash <= 0) {
-                    continue; // top-level entry already handled or unknown
-                }
-                final String prefix = name.substring(0, slash);
-                final String rest = name.substring(slash + 1);
-                if (rest.equals("dim-data.bin")) {
-                    dimEntryByPrefix.put(prefix, e);
-                } else if (rest.startsWith("region-data-")) {
-                    regionEntriesByPrefix.computeIfAbsent(prefix, k -> new ArrayList<>()).add(e);
-                }
+            // Defensive anchor cross-check.
+            final Dimension.Anchor expectedAnchor;
+            try {
+                expectedAnchor = Dimension.Anchor.fromString(prefix);
+            } catch (RuntimeException e) {
+                throw new UnloadableWorldException(
+                        "Cannot parse dimension anchor from entry path '" + prefix + "'",
+                        e, metadata);
+            }
+            if (! expectedAnchor.equals(dim.getAnchor())) {
+                throw new UnloadableWorldException(
+                        "Anchor mismatch in '" + prefix + "': dim-data.bin has " + dim.getAnchor()
+                                + " but path prefix implies " + expectedAnchor,
+                        metadata);
             }
 
-            // 4. Materialise each dimension and merge its tiles back in.
-            for (Map.Entry<String, ZipEntry> dimEnt : dimEntryByPrefix.entrySet()) {
-                final String prefix = dimEnt.getKey();
-                final Dimension dim;
-                try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(
-                        zip.getInputStream(dimEnt.getValue()),
+            dim.attachWorldFromLoad(world);
+            world.attachDimensionFromLoad(dim);
+
+            final List<ZipEntry> regionEntries = regionEntriesByPrefix.getOrDefault(prefix, List.of());
+            for (ZipEntry regionEntry : regionEntries) {
+                try (WPCustomObjectInputStream wrappedIn = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectInputStream(
+                        zip.getInputStream(regionEntry),
                         PluginManager.getPluginClassLoader(),
                         AbstractObject.class)) {
                     final Object obj = wrappedIn.readObject();
-                    if (obj instanceof Dimension) {
-                        dim = (Dimension) obj;
-                    } else {
+                    if (! (obj instanceof List)) {
                         throw new UnloadableWorldException(
-                                prefix + "/dim-data.bin contains object of unexpected type " + obj.getClass(),
+                                regionEntry.getName() + " contains object of unexpected type " + obj.getClass(),
                                 metadata);
                     }
-                }
-
-                // Sanity-check that the entry-name anchor and the deserialised anchor agree.
-                // Defensive — catches a malformed/corrupted archive early rather than silently
-                // attaching a Surface dim to the End slot.
-                final Dimension.Anchor expectedAnchor;
-                try {
-                    expectedAnchor = Dimension.Anchor.fromString(prefix);
-                } catch (RuntimeException e) {
-                    throw new UnloadableWorldException(
-                            "Cannot parse dimension anchor from entry path '" + prefix + "'",
-                            e, metadata);
-                }
-                if (! expectedAnchor.equals(dim.getAnchor())) {
-                    throw new UnloadableWorldException(
-                            "Anchor mismatch in '" + prefix + "': dim-data.bin has " + dim.getAnchor()
-                                    + " but path prefix implies " + expectedAnchor,
-                            metadata);
-                }
-
-                // Re-link world ↔ dim.
-                dim.attachWorldFromLoad(world);
-                world.attachDimensionFromLoad(dim);
-
-                // Pull in this dimension's regions.
-                final List<ZipEntry> regionEntries = regionEntriesByPrefix.getOrDefault(prefix, List.of());
-                for (ZipEntry regionEntry : regionEntries) {
-                    try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(
-                            zip.getInputStream(regionEntry),
-                            PluginManager.getPluginClassLoader(),
-                            AbstractObject.class)) {
-                        final Object obj = wrappedIn.readObject();
-                        if (! (obj instanceof List)) {
-                            throw new UnloadableWorldException(
-                                    regionEntry.getName() + " contains object of unexpected type " + obj.getClass(),
-                                    metadata);
-                        }
-                        final List<Tile> tileList = (List<Tile>) obj;
-                        for (Tile tile : tileList) {
-                            dim.attachTileFromLoad(tile);
-                        }
+                    final List<Tile> tileList = (List<Tile>) obj;
+                    for (Tile tile : tileList) {
+                        dim.attachTileFromLoad(tile);
                     }
                 }
             }
-        } catch (ZipException | StreamCorruptedException | IllegalArgumentException | ClassNotFoundException | InvalidClassException | EOFException e) {
-            throw new UnloadableWorldException(e.getClass().getSimpleName() + " while loading world", e, metadata);
         }
-        if (metadata != null) {
-            world.setMetadata(metadata);
+    }
+
+    /**
+     * Carrier exception used to escape from the {@code withLoadBinding} {@code IOAction} lambda
+     * when an UnloadableWorldException is thrown from inside it. {@code IOAction} only declares
+     * {@code IOException}, and we don't want to weaken its signature for one call site.
+     */
+    private static final class WrappedUnloadable extends RuntimeException {
+        final UnloadableWorldException original;
+        WrappedUnloadable(UnloadableWorldException e) {
+            super(e);
+            this.original = e;
         }
     }
 

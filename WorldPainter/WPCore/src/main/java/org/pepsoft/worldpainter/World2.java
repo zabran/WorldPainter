@@ -604,13 +604,21 @@ public class World2 extends InstanceKeeper implements Serializable, Cloneable {
     }
 
     public synchronized void save(ZipOutputStream out) throws IOException {
-        // First serialise everything but the dimensions to a separate file
+        // First serialise everything but the dimensions to a separate file.
+        // The ObjectOutputStream factory call (vs. `new ObjectOutputStream(out)`) is what makes
+        // this method participate in the compartmentalised save's layer-deduplication scheme: when
+        // WorldIO.saveCompartmentalised has bound a LayerRegistry on this thread, the factory
+        // returns a CompartmentalisedObjectOutputStream that replaces every Layer reference in the
+        // graph with a LayerRef into the shared registry. With no binding, behaviour is identical
+        // to a plain ObjectOutputStream — so callers that aren't going through the
+        // compartmentalised path (none in production today; preserved for any future direct call)
+        // see no change.
         out.putNextEntry(new ZipEntry("world-data.bin"));
         try {
             final Map<Anchor, Dimension> savedDimensions = dimensionsByAnchor;
             try {
                 dimensionsByAnchor = null;
-                final ObjectOutputStream dataout = new ObjectOutputStream(out);
+                final ObjectOutputStream dataout = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectOutputStream(out);
                 dataout.writeObject(this);
                 dataout.flush();
             } finally {
