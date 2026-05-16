@@ -182,43 +182,46 @@ public class DefaultDockingManager implements DockingManager {
 
     @Override
     public void loadLayoutFrom(InputStream in) {
-        if (!layoutDeployed) {
-            deployInitialLayout();
-        }
-        // Buffer the bytes so we can peek the magic and, if it isn't ours, attempt the JIDE
-        // recovery path on the same data.
+        // Buffer the bytes once so we can try multiple decode paths against the same data.
         final byte[] bytes;
         try {
             bytes = in.readAllBytes();
         } catch (IOException e) {
             logger.warn("Could not read docking layout bytes; using defaults.", e);
+            if (!layoutDeployed) deployInitialLayout();
             return;
+        }
+
+        // ----- JIDE-import fast path (must run BEFORE the initial layout deploys) -------------
+        // A release-WP user's config carries layout bytes in the proprietary JIDE Docking
+        // Framework binary format. We extract the panel→side+index mapping and write it back
+        // onto each DockableFrame's initSide/initIndex *before* deployInitialLayout reads
+        // those fields. The deploy then arranges the panels exactly as release WP had them,
+        // with no need to redeploy afterwards. JideLayoutImporter returns false if the bytes
+        // don't look like JIDE format — we then fall through to the DockingFrames path. The
+        // import only runs when the layout hasn't been deployed yet (i.e. first launch of the
+        // app); for subsequent per-dimension layout loads after deployment, it's the
+        // DockingFrames CControl.read path that does the work.
+        if (!layoutDeployed) {
+            try {
+                if (JideLayoutImporter.tryImport(bytes, frames)) {
+                    logger.info("Restored panel arrangement from JIDE-format layout bytes.");
+                    deployInitialLayout();
+                    return;
+                }
+            } catch (RuntimeException e) {
+                logger.warn("JIDE-import attempt threw; falling back to DockingFrames decode.", e);
+            }
+            // Not JIDE (or import wasn't applicable) — let the deploy happen with the
+            // built-in DockableFrameBuilder defaults, then try CControl.read.
+            deployInitialLayout();
         }
 
         try (DataInputStream dis = new DataInputStream(new java.io.ByteArrayInputStream(bytes))) {
             control.read(dis);
-            return;
         } catch (IOException | RuntimeException e) {
-            // Fall through to JIDE-import attempt below.
-            logger.debug("CControl.read could not parse the layout bytes ({}); trying JIDE import path…",
+            logger.info("Layout bytes weren't a DockingFrames CControl.write — using whatever's deployed. ({})",
                     e.toString());
-        }
-
-        // JIDE-import path: a release-WP user's config may carry bytes in the proprietary JIDE
-        // Docking Framework binary format. We import what we can (panel→side mapping at minimum)
-        // and apply it on top of our default DockingFrames layout. Falls back to defaults if the
-        // bytes aren't recognisably JIDE either, or if the import isn't yet implemented for the
-        // observed flavour. See JideLayoutImporter for the parser; see JideBytesDumper for the
-        // forensic tool that drives its development.
-        try {
-            final boolean imported = JideLayoutImporter.tryImport(bytes, this);
-            if (imported) {
-                logger.info("Restored panel arrangement from JIDE-format layout bytes.");
-            } else {
-                logger.info("Layout bytes were not in DockingFrames OR a recognised JIDE format; using defaults.");
-            }
-        } catch (RuntimeException e) {
-            logger.warn("JIDE-import path threw — using defaults.", e);
         }
     }
 
