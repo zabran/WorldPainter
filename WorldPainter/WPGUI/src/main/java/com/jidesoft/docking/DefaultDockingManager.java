@@ -185,10 +185,40 @@ public class DefaultDockingManager implements DockingManager {
         if (!layoutDeployed) {
             deployInitialLayout();
         }
-        try (DataInputStream dis = new DataInputStream(in)) {
+        // Buffer the bytes so we can peek the magic and, if it isn't ours, attempt the JIDE
+        // recovery path on the same data.
+        final byte[] bytes;
+        try {
+            bytes = in.readAllBytes();
+        } catch (IOException e) {
+            logger.warn("Could not read docking layout bytes; using defaults.", e);
+            return;
+        }
+
+        try (DataInputStream dis = new DataInputStream(new java.io.ByteArrayInputStream(bytes))) {
             control.read(dis);
+            return;
         } catch (IOException | RuntimeException e) {
-            logger.warn("Could not restore docking layout (likely from a previous JIDE-based version); using defaults.", e);
+            // Fall through to JIDE-import attempt below.
+            logger.debug("CControl.read could not parse the layout bytes ({}); trying JIDE import path…",
+                    e.toString());
+        }
+
+        // JIDE-import path: a release-WP user's config may carry bytes in the proprietary JIDE
+        // Docking Framework binary format. We import what we can (panel→side mapping at minimum)
+        // and apply it on top of our default DockingFrames layout. Falls back to defaults if the
+        // bytes aren't recognisably JIDE either, or if the import isn't yet implemented for the
+        // observed flavour. See JideLayoutImporter for the parser; see JideBytesDumper for the
+        // forensic tool that drives its development.
+        try {
+            final boolean imported = JideLayoutImporter.tryImport(bytes, this);
+            if (imported) {
+                logger.info("Restored panel arrangement from JIDE-format layout bytes.");
+            } else {
+                logger.info("Layout bytes were not in DockingFrames OR a recognised JIDE format; using defaults.");
+            }
+        } catch (RuntimeException e) {
+            logger.warn("JIDE-import path threw — using defaults.", e);
         }
     }
 
