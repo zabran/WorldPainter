@@ -117,7 +117,7 @@ public class WorldFileSmokeTest extends AbstractTool {
         logger.info("Compartmentalised ZIP save: {} ms ({} bytes) -> {}",
                 zipSaveMs, zipOut.length(), zipOut.getAbsolutePath());
 
-        // -------- 5. Re-load from ZIP — the new round-trip test --------
+        // -------- 5. Re-load from ZIP via the explicit File API --------
         final long zipReloadStart = System.currentTimeMillis();
         final WorldIO zipReloader = new WorldIO();
         zipReloader.loadCompartmentalised(zipOut);
@@ -139,6 +139,55 @@ public class WorldFileSmokeTest extends AbstractTool {
             System.exit(4);
         }
         logger.info("Compartmentalised round-trip: PASSED");
+
+        // -------- 6. Verify magic-byte dispatch in load(File) --------
+        // The whole point of A1 is that callers can hand the same File to load() and the right
+        // path runs automatically. Round-trip both formats via load(File) and confirm tile counts.
+        final long dispatchLegacyStart = System.currentTimeMillis();
+        final WorldIO dispatchLegacy = new WorldIO();
+        dispatchLegacy.load(legacyOut);
+        final long dispatchLegacyMs = System.currentTimeMillis() - dispatchLegacyStart;
+        int dispatchLegacyTiles = 0;
+        for (Dimension dim : dispatchLegacy.getWorld().getDimensions()) {
+            dispatchLegacyTiles += dim.getTileCount();
+        }
+        if (dispatchLegacyTiles != totalTiles) {
+            logger.error("load(File) dispatch (legacy GZIP) FAILED: {} tiles, expected {}", dispatchLegacyTiles, totalTiles);
+            System.exit(5);
+        }
+        logger.info("load(File) dispatch (legacy GZIP): {} ms — PASSED", dispatchLegacyMs);
+
+        final long dispatchZipStart = System.currentTimeMillis();
+        final WorldIO dispatchZip = new WorldIO();
+        dispatchZip.load(zipOut);
+        final long dispatchZipMs = System.currentTimeMillis() - dispatchZipStart;
+        int dispatchZipTiles = 0;
+        for (Dimension dim : dispatchZip.getWorld().getDimensions()) {
+            dispatchZipTiles += dim.getTileCount();
+        }
+        if (dispatchZipTiles != totalTiles) {
+            logger.error("load(File) dispatch (compartmentalised ZIP) FAILED: {} tiles, expected {}", dispatchZipTiles, totalTiles);
+            System.exit(5);
+        }
+        logger.info("load(File) dispatch (compartmentalised ZIP): {} ms — PASSED", dispatchZipMs);
+
+        // -------- 7. Verify load(InputStream) spool path for ZIPs --------
+        // Less-common path but supported (preserves the legacy InputStream signature).
+        final long streamSpoolStart = System.currentTimeMillis();
+        final WorldIO streamSpool = new WorldIO();
+        try (BufferedInputStream in = new BufferedInputStream(new FileInputStream(zipOut), 1 << 20)) {
+            streamSpool.load(in);
+        }
+        final long streamSpoolMs = System.currentTimeMillis() - streamSpoolStart;
+        int streamSpoolTiles = 0;
+        for (Dimension dim : streamSpool.getWorld().getDimensions()) {
+            streamSpoolTiles += dim.getTileCount();
+        }
+        if (streamSpoolTiles != totalTiles) {
+            logger.error("load(InputStream) spool (compartmentalised ZIP) FAILED: {} tiles, expected {}", streamSpoolTiles, totalTiles);
+            System.exit(6);
+        }
+        logger.info("load(InputStream) ZIP spool: {} ms — PASSED", streamSpoolMs);
 
         // -------- 5. PR #478 microbenchmark --------
         runPr478Benchmark();

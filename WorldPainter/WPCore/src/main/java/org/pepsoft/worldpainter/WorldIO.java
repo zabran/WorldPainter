@@ -97,9 +97,51 @@ public class WorldIO {
     }
 
     /**
+     * Load a world from a file. Detects the on-disk format from the first two bytes:
+     * <ul>
+     *   <li>{@code 1F 8B} (GZIP magic) → dispatches to {@link #load(InputStream)} (legacy single-stream format)</li>
+     *   <li>{@code 50 4B} (ZIP local-file-header magic, "PK") → dispatches to {@link #loadCompartmentalised(File)} (new region-wise format)</li>
+     *   <li>anything else → {@link UnloadableWorldException}</li>
+     * </ul>
+     *
+     * <p>This is the preferred load entry point for callers that have a file on disk —
+     * unlike {@link #load(InputStream)}, it never has to spool the new format to a temp
+     * file because {@link ZipFile} can read it in place.
+     *
+     * @param file The {@code .world} or {@code .world.zip} file to load.
+     */
+    public void load(File file) throws IOException, UnloadableWorldException {
+        final byte[] magic = new byte[2];
+        try (InputStream in = new FileInputStream(file)) {
+            final int read = in.read(magic);
+            if (read < 2) {
+                throw new UnloadableWorldException("File is too short to be a WorldPainter world (" + read + " bytes)", null);
+            }
+        }
+        if (isGzipMagic(magic)) {
+            try (FileInputStream in = new FileInputStream(file)) {
+                load(in);
+            }
+        } else if (isZipMagic(magic)) {
+            loadCompartmentalised(file);
+        } else {
+            throw new UnloadableWorldException(
+                    String.format("File does not start with a recognised magic (got 0x%02X 0x%02X — expected GZIP 0x1F 0x8B or ZIP 0x50 0x4B)", magic[0] & 0xFF, magic[1] & 0xFF),
+                    null);
+        }
+    }
+
+    /**
      * Load a world from a binary stream to which it was previously saved by
-     * {@link #save(OutputStream)}, or by a previous version of WorldPainter.
-     * The stream is closed before returning.
+     * {@link #save(OutputStream)} or {@link #saveCompartmentalised(OutputStream)}, or by a
+     * previous version of WorldPainter. The stream is closed before returning.
+     *
+     * <p>Sniffs the first two bytes to dispatch between the legacy GZIP path and the new
+     * compartmentalised ZIP path. The ZIP path requires random access (
+     * {@link ZipFile}), so when this method receives a ZIP stream it spools the remaining
+     * bytes to a temporary file before dispatching to {@link #loadCompartmentalised(File)}.
+     * Callers that already have a {@link File} should prefer {@link #load(File)} to avoid
+     * the spool.
      *
      * @param in The stream from which to load the world.
      * @throws IOException If an I/O error occurred loading the world.
@@ -109,10 +151,45 @@ public class WorldIO {
      */
     @SuppressWarnings("unchecked") // Guaranteed by WorldPainter
     public void load(InputStream in) throws IOException, UnloadableWorldException {
+        // PushbackInputStream lets us peek two bytes without losing them.
+        final PushbackInputStream pin = new PushbackInputStream(in, 2);
+        final byte[] magic = new byte[2];
+        final int read = pin.read(magic);
+        if (read < 2) {
+            try { pin.close(); } catch (IOException ignored) {}
+            throw new UnloadableWorldException("Stream is too short to be a WorldPainter world (" + Math.max(0, read) + " bytes)", null);
+        }
+        pin.unread(magic);
+
+        if (isZipMagic(magic)) {
+            // Spool the whole stream to a temp file so we can hand it to ZipFile.
+            final File tmp = File.createTempFile("wp-load-", ".world.zip");
+            try {
+                try (OutputStream out = new BufferedOutputStream(new FileOutputStream(tmp), 1 << 20)) {
+                    pin.transferTo(out);
+                } finally {
+                    pin.close();
+                }
+                loadCompartmentalised(tmp);
+            } finally {
+                if (! tmp.delete()) {
+                    tmp.deleteOnExit();
+                }
+            }
+            return;
+        }
+        if (! isGzipMagic(magic)) {
+            try { pin.close(); } catch (IOException ignored) {}
+            throw new UnloadableWorldException(
+                    String.format("Stream does not start with a recognised magic (got 0x%02X 0x%02X — expected GZIP 0x1F 0x8B or ZIP 0x50 0x4B)", magic[0] & 0xFF, magic[1] & 0xFF),
+                    null);
+        }
+
+        // Legacy GZIP path.
         Map<String, Object> metadata = null;
         world = null;
         try {
-            try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(new GZIPInputStream(in), PluginManager.getPluginClassLoader(), AbstractObject.class)) {
+            try (WPCustomObjectInputStream wrappedIn = new WPCustomObjectInputStream(new GZIPInputStream(pin), PluginManager.getPluginClassLoader(), AbstractObject.class)) {
                 Object object = wrappedIn.readObject();
                 if (object instanceof Map) {
                     metadata = (Map<String, Object>) object;
@@ -138,6 +215,14 @@ public class WorldIO {
         if (metadata != null) {
             world.setMetadata(metadata);
         }
+    }
+
+    private static boolean isGzipMagic(byte[] m) {
+        return (m[0] & 0xFF) == 0x1F && (m[1] & 0xFF) == 0x8B;
+    }
+
+    private static boolean isZipMagic(byte[] m) {
+        return (m[0] & 0xFF) == 0x50 && (m[1] & 0xFF) == 0x4B; // "PK"
     }
 
     /**
