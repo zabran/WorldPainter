@@ -1177,6 +1177,24 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
             File oldConfigFile = new File(System.getProperty("user.home"), ".worldpainter/config");
             if (oldConfigFile.isFile()) {
                 migrateConfiguration();
+            } else {
+                // Cross-classifier first-run migration: if the user is launching us (a
+                // [SNAPSHOT]-classifier build, or any custom classifier) for the first time and
+                // they already have a release-channel WorldPainter install, adopt the release
+                // config so all of their CustomLayers, MixedMaterials, custom-terrain slots,
+                // recent files, world-directory paths, preferences, etc. carry over.
+                //
+                // We copy (not move) — the release WP keeps working independently. JIDE-format
+                // docking-layout bytes that travel along are picked up by our DockingFrames-based
+                // DockingManager.loadLayoutFrom, which catches the format-mismatch exception and
+                // falls back to the default layout (already covered).
+                File releaseDir = getReleaseChannelConfigDir();
+                if (releaseDir != null) {
+                    File releaseConfig = new File(releaseDir, "config");
+                    if (releaseConfig.isFile()) {
+                        migrateConfigurationFromReleaseChannel(releaseDir);
+                    }
+                }
             }
         }
         if (configFile.isFile()) {
@@ -1185,6 +1203,75 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
         } else {
             return null;
         }
+    }
+
+    /**
+     * Return the release-channel config directory if (a) we're currently running with a non-null
+     * classifier (e.g. {@code "snapshot"}) and (b) the release directory is somewhere we can
+     * point at. Returns {@code null} if we ARE the release channel (no migration needed).
+     *
+     * <p>"Release channel" means the same OS-specific base directory as {@link #getConfigDir} but
+     * without the {@code [CLASSIFIER]} suffix.
+     */
+    private static File getReleaseChannelConfigDir() {
+        // Compute our current classifier the same way getConfigDir does. If null, we ARE the
+        // release channel — nothing upstream to migrate from.
+        String classifier = System.getProperty("org.pepsoft.worldpainter.classifier");
+        if (classifier != null) {
+            classifier = classifier.trim();
+            if (classifier.isEmpty()) {
+                classifier = null;
+            }
+        }
+        if ((classifier == null) && Version.isSnapshot()) {
+            classifier = "snapshot";
+        }
+        if (classifier == null) {
+            return null;
+        }
+        if (SystemUtils.isMac()) {
+            return new File(System.getProperty("user.home"), "Library/Application Support/WorldPainter");
+        } else if (SystemUtils.isWindows()) {
+            final String appDataStr = System.getenv("APPDATA");
+            if (appDataStr != null) {
+                return new File(appDataStr, "WorldPainter");
+            }
+        }
+        final File legacy = new File(HOME, ".worldpainter");
+        if (legacy.isDirectory()) {
+            return legacy;
+        }
+        return new File(XDG_DATA_HOME, "worldpainter");
+    }
+
+    /**
+     * Copy (don't move) the release-channel config + plugins dir to our current classifier's dir.
+     * Idempotent in the sense that it just overwrites anything in the target — but only called
+     * by {@link #load()} when the target dir doesn't have a config file yet, so practically it's
+     * a first-run thing.
+     */
+    private static void migrateConfigurationFromReleaseChannel(File releaseDir) throws IOException {
+        final File targetDir = getConfigDir();
+        logger.info("First-run snapshot/classifier launch: importing release-channel config from {} to {}",
+                releaseDir.getAbsolutePath(), targetDir.getAbsolutePath());
+        if (! targetDir.isDirectory()) {
+            //noinspection ResultOfMethodCallIgnored
+            targetDir.mkdirs();
+        }
+        // 1. config (the serialised Configuration). This is the big one — carries CustomLayers,
+        //    MixedMaterials, custom terrains, preferences, paths, recent files, etc.
+        final File releaseConfig = new File(releaseDir, "config");
+        if (releaseConfig.isFile()) {
+            FileUtils.copyFileToDir(releaseConfig, targetDir);
+        }
+        // 2. plugins (signed plugin jars the user has installed). PluginManager will pick them up
+        //    from the new location on the same launch.
+        final File releasePlugins = new File(releaseDir, "plugins");
+        if (releasePlugins.isDirectory()) {
+            FileUtils.copyDir(releasePlugins, new File(targetDir, "plugins"));
+        }
+        // Note: NOT copying autosave.*.world or logfile* — those are runtime artifacts of the
+        // release build's runs and shouldn't be inherited.
     }
 
     public static synchronized Configuration load(File configFile) throws IOException, ClassNotFoundException {
