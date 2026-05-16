@@ -19,7 +19,9 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.Vector;
 
 import static org.pepsoft.minecraft.Block.BLOCKS;
@@ -27,6 +29,7 @@ import static org.pepsoft.minecraft.Material.MINECRAFT;
 import static org.pepsoft.util.AwtUtils.doLaterOnEventThread;
 import static org.pepsoft.util.CollectionUtils.copyOf;
 import static org.pepsoft.util.swing.MessageUtils.beepAndShowError;
+import static org.pepsoft.util.swing.MessageUtils.beepAndShowWarning;
 import static org.pepsoft.worldpainter.Platform.Capability.NAME_BASED;
 
 /**
@@ -47,6 +50,7 @@ public class MaterialSelector extends javax.swing.JPanel {
         Vector<String> minecraftNames = new Vector<>(Material.getAllSimpleNamesForNamespace(Material.MINECRAFT));
         Collections.sort(minecraftNames);
         comboBoxMinecraftName.setModel(new DefaultComboBoxModel<>(minecraftNames));
+        comboBoxMinecraftName.setRenderer(new VersionRangeAwareRenderer());
         
         Vector<String> namespaces = new Vector<>(Material.getAllNamespaces());
         Collections.sort(namespaces);
@@ -435,9 +439,61 @@ public class MaterialSelector extends javax.swing.JPanel {
             }
             if (material != oldMaterial) {
                 firePropertyChange("material", null, material);
+                maybeWarnVersionMismatch(oldMaterial, material, previousProgrammaticChange);
             }
         } finally {
             programmaticChange = previousProgrammaticChange;
+        }
+    }
+
+    /**
+     * If the user has just chosen a block that's incompatible with the current target platform's
+     * MC version (e.g. {@code minecraft:dirt_path} on a 1.16 map), surface a non-blocking
+     * warning. Suppressed when {@code setMaterial} was called programmatically (we don't want to
+     * pester the user about choices that weren't theirs), and de-duplicated per material name so
+     * editing properties on the same block doesn't re-fire it.
+     */
+    private void maybeWarnVersionMismatch(Material oldMaterial, Material newMaterial,
+                                          boolean wasProgrammaticChange) {
+        if (wasProgrammaticChange || platform == null || newMaterial == null) {
+            return;
+        }
+        if (oldMaterial != null && newMaterial.name.equals(oldMaterial.name)) {
+            return; // same block, just properties tweaked
+        }
+        String message = MaterialVersions.checkCompatibility(newMaterial, platform);
+        if (message == null || !warnedAbout.add(newMaterial.name)) {
+            return;
+        }
+        doLaterOnEventThread(() -> beepAndShowWarning(this, message
+                + "\n\nThis is only a warning — the block stays selected. Adjust your target"
+                + " platform under Edit › World Properties if you want exports to honour it.",
+                "Version-Incompatible Block"));
+    }
+
+    /** Blocks we've already warned about in this selector's lifetime, to avoid spamming. */
+    private final Set<String> warnedAbout = new HashSet<>();
+
+    /**
+     * Renders the {@code minecraft:*} block-name combo entries with a small version badge
+     * (e.g. {@code "1.17+"} or {@code "≤ 1.16"}) when the block has known version constraints.
+     * Helps users notice that the block they're about to pick may not match their target.
+     */
+    private static class VersionRangeAwareRenderer extends DefaultListCellRenderer {
+        @Override
+        public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                     boolean isSelected, boolean cellHasFocus) {
+            Component c = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+            if (value instanceof String && c instanceof JLabel) {
+                String simpleName = (String) value;
+                String range = MaterialVersions.versionRangeText(Material.MINECRAFT + ":" + simpleName);
+                if (range != null) {
+                    JLabel label = (JLabel) c;
+                    label.setText("<html>" + simpleName
+                            + " <span style='color:gray; font-size:90%;'>· " + range + "</span></html>");
+                }
+            }
+            return c;
         }
     }
 
