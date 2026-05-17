@@ -2376,6 +2376,22 @@ public final class App extends JFrame implements BrushControl,
                         // save of a new world), the call falls through to a full save.
                         world.addHistoryEntry(HistoryEntry.WORLD_SAVED, normalisedFile);
                         final WorldIO worldIO = new WorldIO(world);
+                        // B4: when the world is lazy-loaded from normalisedFile, we hold the
+                        // file open via LazyArchive. The backup-rotation rename below requires
+                        // every handle released. Force every tile resident, then close the
+                        // archive — world stays usable post-save in fully-eager state.
+                        if (world.getLazyArchive() != null) {
+                            for (Dimension dim : world.getDimensions()) {
+                                if (dim.getTilePager() != null) {
+                                    dim.getTiles(); // force eagerLoadAll
+                                }
+                            }
+                            try {
+                                world.closeLazyResources();
+                            } catch (IOException closeEx) {
+                                logger.warn("Could not close lazy archive before save: {}", closeEx.toString());
+                            }
+                        }
                         if (legacy) {
                             worldIO.save(new FileOutputStream(tempFile));
                         } else {

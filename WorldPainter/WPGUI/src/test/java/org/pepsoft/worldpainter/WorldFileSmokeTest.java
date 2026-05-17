@@ -429,6 +429,41 @@ public class WorldFileSmokeTest extends AbstractTool {
                             ? dim.getTilePager().getTotalLoadNanos() / dim.getTilePager().getTotalLoadCount() / 1_000_000
                             : 0);
 
+            // -------- 8a. B4 — save from a lazy-loaded world (to a different file) --------
+            // Verifies that saveCompartmentalised reading tiles via the lazy archive works,
+            // and that the resulting file round-trips back to the same tile count. We save
+            // to a fresh path so we don't hit the rename-while-source-locked scenario
+            // (App.java handles that via eagerLoadAll + closeLazyResources before save).
+            final File lazySaveOut = new File(zipOut.getParentFile(),
+                    zipOut.getName().replace(".zip", "-from-lazy.zip"));
+            if (lazySaveOut.exists()) { lazySaveOut.delete(); }
+            final long lazySaveStart = System.currentTimeMillis();
+            try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(lazySaveOut), 1 << 20)) {
+                new WorldIO(lazyWorld).saveCompartmentalised(out);
+            }
+            final long lazySaveMs = System.currentTimeMillis() - lazySaveStart;
+            logger.info("Save from lazy state: {} ms ({} bytes)", lazySaveMs, lazySaveOut.length());
+
+            // Round-trip back (eager mode, separate WorldIO).
+            final boolean wasLazy = cfg.isRegionPagingEnabled();
+            cfg.setRegionPagingEnabled(false);
+            try {
+                final WorldIO lazySaveReloader = new WorldIO();
+                lazySaveReloader.loadCompartmentalised(lazySaveOut);
+                int reloadFromLazyTiles = 0;
+                for (Dimension d : lazySaveReloader.getWorld().getDimensions()) {
+                    reloadFromLazyTiles += d.getTileCount();
+                }
+                if (reloadFromLazyTiles != totalTiles) {
+                    logger.error("B4 FAILED: save-from-lazy round-trip lost tiles "
+                            + "({} vs {})", reloadFromLazyTiles, totalTiles);
+                    System.exit(12);
+                }
+                logger.info("Save-from-lazy round-trip: PASSED");
+            } finally {
+                cfg.setRegionPagingEnabled(wasLazy);
+            }
+
             // Close to release the file handle.
             lazyWorld.closeLazyResources();
             logger.info("Lazy round-trip: PASSED");
