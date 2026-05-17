@@ -156,6 +156,133 @@
                     <reuseForks>false</reuseForks>
                 </configuration>
             </plugin>
+            <!--
+              Fork distribution: a single fat JAR with all dependencies, runnable via the
+              provided run-worldpainter.bat / .sh launcher (which adds the JVM add-opens
+              flags that jide-oss needs to install its L F extensions under the JDK 17
+              module system; these can't go in a JAR manifest).
+              Only built when the "dist" profile is active to keep mvn install fast for
+              development. Build with: mvn -pl WPGUI -am -Pdist package -DskipTests=true
+              Output: WPGUI/target/worldpainter-fork-VERSION-fat.jar (about 80 to 100 MB).
+            -->
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>dist</id>
+            <build>
+                <plugins>
+                    <!--
+                      WPCore and WPGUI both ship a resource at the root path
+                      org.pepsoft.worldpainter.plugins (the WP plugin descriptor).
+                      WPCore's lists 3 core plugins (DefaultPlugin, JavaPlatformProvider,
+                      DefaultCustomObjectProvider); WPGUI's lists 1 GUI plugin
+                      (DefaultLayerEditorProvider). At runtime in the regular build,
+                      ClassLoader.getResources("org.pepsoft.worldpainter.plugins") finds
+                      BOTH copies (one per JAR) and loads all 4.
+
+                      In a shaded fat JAR there's only one classpath root, so one of the two
+                      manifests gets dropped on shade. Without JavaPlatformProvider the app
+                      crashes immediately (no platform registered → setDimension hits a null
+                      layerControls).
+
+                      Fix: before the shade phase, write a MERGED descriptor to
+                      target/classes/org.pepsoft.worldpainter.plugins, overwriting the
+                      WPGUI-only one. Then in the shade config, EXCLUDE the descriptor from
+                      WPCore.jar so only the merged file makes it into the fat JAR.
+
+                      The merged file is generated here rather than committed to git so it
+                      stays in sync with whatever the modules actually ship. If a new
+                      plugin class is added to either module the shade WARNING about an
+                      overlapping resource will surface during the build — update this list
+                      then.
+                    -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>merge-plugin-descriptors</id>
+                                <phase>prepare-package</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <echo file="${project.build.outputDirectory}/org.pepsoft.worldpainter.plugins"><![CDATA[{
+  "name": "WorldPainter (fork merged descriptor)",
+  "version": "${project.version}",
+  "classes": [
+    "org.pepsoft.worldpainter.DefaultPlugin",
+    "org.pepsoft.worldpainter.platforms.JavaPlatformProvider",
+    "org.pepsoft.worldpainter.DefaultCustomObjectProvider",
+    "org.pepsoft.worldpainter.layers.DefaultLayerEditorProvider"
+  ]
+}
+]]></echo>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <version>3.5.3</version>
+                        <executions>
+                            <execution>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>shade</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- Keep the regular WPGUI.jar untouched; the fat JAR is a
+                                         separate artifact with a distinct finalName so we don't
+                                         clobber the development jar that exec:exec uses. -->
+                                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                                    <shadedArtifactAttached>true</shadedArtifactAttached>
+                                    <shadedClassifierName>fat</shadedClassifierName>
+                                    <finalName>worldpainter-fork-${project.version}</finalName>
+                                    <transformers>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                            <mainClass>org.pepsoft.worldpainter.Main</mainClass>
+                                        </transformer>
+                                        <!-- Merge META-INF/services entries (SLF4J providers, JNBT, etc.)
+                                             so per-jar service lists don't overwrite each other. -->
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                    </transformers>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <!-- Strip signatures from signed jars; shade
+                                                     repacking invalidates them and a leftover .SF
+                                                     causes JVM startup to fail with
+                                                     SecurityException: digest mismatch. -->
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                                <exclude>module-info.class</exclude>
+                                            </excludes>
+                                        </filter>
+                                        <filter>
+                                            <!-- Drop WPCore's plugin descriptor: the merged one
+                                                 generated by antrun-plugin (above) in
+                                                 target/classes/ takes its place. -->
+                                            <artifact>org.pepsoft.worldpainter:WPCore</artifact>
+                                            <excludes>
+                                                <exclude>org.pepsoft.worldpainter.plugins</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
