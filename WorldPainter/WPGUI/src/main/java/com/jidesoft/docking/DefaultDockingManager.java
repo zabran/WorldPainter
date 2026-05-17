@@ -233,14 +233,40 @@ public class DefaultDockingManager implements DockingManager {
         if (jidePlacements != null) {
             // (a) Apply (side, index) to each frame's init fields. Has to happen before any
             // deploy so the deploy reads the imported values.
+            //
+            // Special handling for FLOATING groups: by default release WP declares its
+            // floating-by-default panels at the same (side, index) as some DOCKED panels
+            // (e.g. biomes/layers/annotations AND terrain all default to (WEST, 3)). If we
+            // copy those defaults into our build verbatim, the deploy puts all four of them
+            // in the same tab-stack. Then when we later setExtendedMode(EXTERNALIZED) one of
+            // the floaters, DockingFrames pulls the whole tab-stack out — terrain comes along
+            // for the ride. Fix: bump every FLOATING panel's initIndex to a fresh value
+            // (shared within a group, so they still tab-stack with each other), leaving the
+            // DOCKED panels at their original index. Terrain stays at (WEST, 3) alone;
+            // biomes/layers/annotations move to (WEST, 99+) and externalize as a group.
+            final int floatingIndexBase = 99;
+            final java.util.Map<Integer, Integer> floatingGroupIndex = new java.util.HashMap<>();
+            int nextFloatingIndex = floatingIndexBase;
             int applied = 0;
             for (java.util.Map.Entry<String, JideLayoutImporter.FramePlacement> e : jidePlacements.entrySet()) {
                 final DockableFrame f = frames.get(e.getKey());
-                if (f != null) {
-                    f.setInitSide(e.getValue().toDockContextSide());
-                    f.setInitIndex(e.getValue().index);
-                    applied++;
+                if (f == null) continue;
+                final JideLayoutImporter.FramePlacement p = e.getValue();
+                f.setInitSide(p.toDockContextSide());
+                if (p.mode == JideLayoutImporter.MODE_FLOATING) {
+                    // Group leader id = smallest member id (stable across re-runs).
+                    int leaderId = p.id;
+                    for (int memberId : p.groupMemberIds) {
+                        if (memberId < leaderId) leaderId = memberId;
+                    }
+                    final int assigned = floatingGroupIndex.computeIfAbsent(leaderId, k -> {
+                        return floatingIndexBase + floatingGroupIndex.size();
+                    });
+                    f.setInitIndex(assigned);
+                } else {
+                    f.setInitIndex(p.index);
                 }
+                applied++;
             }
             logger.info("Restoring layout from JIDE bytes — applied {} of {} placement(s).",
                     applied, jidePlacements.size());
