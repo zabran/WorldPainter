@@ -504,6 +504,42 @@ public class WorldFileSmokeTest extends AbstractTool {
                 logger.info("Tight-budget walk: touched {} tiles, {} regions resident at end, "
                                 + "{} evictions total, {} loads total",
                         touched, loadedAfter, evictions, tightPager.getTotalLoadCount());
+
+                // -------- 8c. B5 — stale-tile listener detach --------
+                // After aggressive eviction, hold a reference to a tile and then force its
+                // region to be reloaded. The held tile is now stale (different Java object
+                // than the freshly-loaded one). If B5's evict-callback correctly detached
+                // Dimension as a Tile.Listener, mutating the stale tile must NOT increment
+                // Dimension.dirtyRegions.
+                final Point testCoord = tightDim.getTileCoords().iterator().next();
+                final Tile heldTile = tightDim.getTile(testCoord);
+                // Walk again — at budget=10, testCoord's region is overwhelmingly likely
+                // to be evicted and reloaded by the time we come back to it.
+                for (Point coord : new HashSet<>(tightDim.getTileCoords())) {
+                    tightDim.getTile(coord);
+                }
+                final Tile freshTile = tightDim.getTile(testCoord);
+                if (freshTile == heldTile) {
+                    logger.warn("B5: testCoord {} wasn't evicted in this run; "
+                            + "skipping stale-tile detach check", testCoord);
+                } else {
+                    final int dirtyBefore = tightDim.getDirtyRegions().size();
+                    // Mutate heldTile and back. Net no-op visible state, but the change
+                    // events would fire if any listener was attached.
+                    final float orig = heldTile.getHeight(0, 0);
+                    heldTile.setHeight(0, 0, orig + 1.0f);
+                    heldTile.setHeight(0, 0, orig);
+                    final int dirtyAfter = tightDim.getDirtyRegions().size();
+                    if (dirtyAfter > dirtyBefore) {
+                        logger.error("B5 FAILED: mutating stale tile {} fired Dimension's "
+                                + "Tile.Listener (dirtyRegions {} -> {})",
+                                testCoord, dirtyBefore, dirtyAfter);
+                        System.exit(13);
+                    }
+                    logger.info("B5 stale-tile detach: PASSED "
+                            + "(mutating evicted tile {} didn't reach Dimension)", testCoord);
+                }
+
                 tightWorld.closeLazyResources();
                 logger.info("LRU eviction under budget=10: PASSED");
             } finally {

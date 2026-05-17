@@ -2342,6 +2342,15 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
     }
 
     /**
+     * The "unwire" half — symmetric to {@link #wireLoadedTile}. Called by the lazy pager just
+     * before it drops an evicted tile from the resident map, so a stale tile reference held
+     * elsewhere (e.g. a render queue) doesn't dispatch change events back into the dimension.
+     */
+    void unwireEvictedTile(Tile tile) {
+        tile.removeListener(this);
+    }
+
+    /**
      * Goal B (lazy mode): replace the in-memory tile set with a coord index only, and attach
      * the given pager so subsequent {@code getTile} calls load regions on demand. Must be
      * called before any tile is read — the current {@code tiles} map must be empty.
@@ -2359,6 +2368,7 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             throw new IllegalStateException("Dimension.tiles is not a PagingTileMap; cannot attach pager");
         }
         pager.setTileLoadedCallback(this::wireLoadedTile);
+        pager.setTileEvictedCallback(this::unwireEvictedTile);
         // Pin dirty regions from eviction — saving them via splice would lose unsaved edits.
         pager.setDirtyRegionsSupplier(this::getDirtyRegions);
         ((PagingTileMap) tiles).setPager(pager);

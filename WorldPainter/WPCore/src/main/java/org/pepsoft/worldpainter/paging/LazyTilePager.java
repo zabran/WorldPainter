@@ -74,6 +74,14 @@ public class LazyTilePager implements TilePager {
     /** Supplies the set of dirty regions to pin from eviction. Null = nothing pinned. */
     private Supplier<Set<Point>> dirtyRegionsSupplier;
 
+    /**
+     * Per-tile callback invoked just before a tile is dropped from resident during eviction.
+     * Receivers detach Dimension as a {@link org.pepsoft.worldpainter.Tile.Listener} so a stale
+     * tile (still alive via an external reference) doesn't dispatch change events back into
+     * the dimension. Symmetric to {@link #tileLoadedCallback}. Null = no cleanup hook.
+     */
+    private Consumer<Tile> tileEvictedCallback;
+
     /** Reentry guard: skip eviction during eagerLoadAll. */
     private boolean eagerLoadInProgress;
 
@@ -112,6 +120,16 @@ public class LazyTilePager implements TilePager {
      */
     public void setTileLoadedCallback(Consumer<Tile> callback) {
         this.tileLoadedCallback = callback;
+    }
+
+    /**
+     * Symmetric to {@link #setTileLoadedCallback}: invoked once per tile just before that tile
+     * is removed from the resident map during eviction. Receivers should detach themselves as
+     * a {@link Tile.Listener} so events on the now-orphaned tile (still reachable via external
+     * references, e.g. a render queue) don't propagate back into the dimension.
+     */
+    public void setTileEvictedCallback(Consumer<Tile> callback) {
+        this.tileEvictedCallback = callback;
     }
 
     @Override
@@ -209,12 +227,19 @@ public class LazyTilePager implements TilePager {
             if (pinned.contains(region)) {
                 continue;
             }
-            // Drop every tile in this 4×4 region from resident. The Dimension's listener
-            // relationship is FROM tile TO listener, so simply releasing the strong reference
-            // here lets the tile's resident-side strong refs drop. GC handles the rest.
+            // Drop every tile in this 4×4 region from resident. Before the drop, fire
+            // tileEvictedCallback so Dimension can detach itself as a Tile.Listener — without
+            // that, a stale-but-still-strongly-referenced tile (e.g. held by a render queue)
+            // that gets mutated downstream would dispatch events into a Dimension whose
+            // .tiles no longer holds this tile, leading to mis-marked dirty regions and
+            // similar surprises.
             for (int dx = 0; dx < 4; dx++) {
                 for (int dy = 0; dy < 4; dy++) {
-                    resident.remove(new Point((region.x << 2) | dx, (region.y << 2) | dy));
+                    final Point coord = new Point((region.x << 2) | dx, (region.y << 2) | dy);
+                    final Tile evicted = resident.remove(coord);
+                    if (evicted != null && tileEvictedCallback != null) {
+                        tileEvictedCallback.accept(evicted);
+                    }
                 }
             }
             it.remove();
