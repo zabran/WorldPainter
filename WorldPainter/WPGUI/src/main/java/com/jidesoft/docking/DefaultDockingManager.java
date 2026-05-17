@@ -315,6 +315,20 @@ public class DefaultDockingManager implements DockingManager {
      */
     private void applyJideModesPostDeploy(java.util.Map<String, JideLayoutImporter.FramePlacement> placements) {
         int minimized = 0, externalized = 0, skipped = 0;
+        // Track the first FLOATING dockable processed so we can bring it to front + force a
+        // tab-strip layout pass at the end (without that, only the LAST externalized panel
+        // renders properly — the others' tabs aren't drawn until the user interacts).
+        bibliothek.gui.dock.common.DefaultSingleCDockable firstFloating = null;
+
+        // For floating groups: the FIRST panel encountered per group goes to its bounded
+        // external location (CExternalizedLocation at the JIDE-saved x, y, w, h). Subsequent
+        // members of the same group go to that location's .stack() — telling DockingFrames
+        // "tab onto whatever's already there." This is what merges all three members of a
+        // group into ONE external window, instead of DockingFrames spawning a separate
+        // window for the latecomers like it did with bare setExtendedMode(EXTERNALIZED).
+        // Group identity is the smallest member id (the canonical "leader" used elsewhere).
+        final java.util.Map<Integer, bibliothek.gui.dock.common.CLocation> groupExternalLocation = new java.util.HashMap<>();
+
         for (java.util.Map.Entry<String, JideLayoutImporter.FramePlacement> e : placements.entrySet()) {
             final bibliothek.gui.dock.common.intern.DefaultCommonDockable ignored = null;
             final bibliothek.gui.dock.common.DefaultSingleCDockable d = dockables.get(e.getKey());
@@ -324,25 +338,56 @@ public class DefaultDockingManager implements DockingManager {
             try {
                 switch (e.getValue().mode) {
                     case JideLayoutImporter.MODE_AUTOHIDE:
+                        // (a) Constrain the popup size for autohide. Without this, DockingFrames
+                        // expands the popup to fill the available flap-station area, which can
+                        // mean the whole app width if the panel ends up in the north/south flap.
+                        final DockableFrame autohideFrame = frames.get(e.getKey());
+                        if (autohideFrame != null) {
+                            final java.awt.Dimension pref = autohideFrame.getPreferredSize();
+                            if (pref != null && pref.width > 0 && pref.height > 0) {
+                                d.setMinimizedSize(pref);
+                            } else {
+                                d.setMinimizedSize(new java.awt.Dimension(250, 400));
+                            }
+                        }
+                        // (b) Explicitly target the correct flap station. By default
+                        // setExtendedMode(MINIMIZED) sends the dockable to whichever flap is
+                        // "closest" to its current location — at grid (0, 0) that ends up being
+                        // the NORTH flap (under the toolbar, app-wide), not the WEST one where
+                        // JIDE had it. Force the right side based on the JIDE-imported side.
+                        d.setLocation(flapLocationFor(e.getValue()));
                         d.setExtendedMode(bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED);
                         minimized++;
                         break;
                     case JideLayoutImporter.MODE_FLOATING:
-                        // For FLOATING panels, pre-position the external window before flipping
-                        // mode so it lands at the JIDE-saved location instead of DockingFrames'
-                        // default centre-ish drop spot. CLocation.external accepts screen-coords
-                        // x/y plus width/height; the parser pulled them from the panel's first
-                        // per-mode sub-record. Members of the same floating group all carry the
-                        // same bounds (we read them per-panel; the values match), so each call
-                        // ends up requesting the same position — the second and third effectively
-                        // merge into the first one's external window via DockingFrames' grouping.
-                        final int[] bounds = e.getValue().floatingBounds;
-                        if (bounds != null) {
-                            d.setLocation(bibliothek.gui.dock.common.CLocation.external(
-                                    bounds[0], bounds[1], bounds[2], bounds[3]));
+                        // Pick the canonical group leader (smallest member id).
+                        int groupLeader = e.getValue().id;
+                        for (int memberId : e.getValue().groupMemberIds) {
+                            if (memberId < groupLeader) groupLeader = memberId;
+                        }
+                        final int[] bnds = e.getValue().floatingBounds;
+                        bibliothek.gui.dock.common.CLocation groupLoc = groupExternalLocation.get(groupLeader);
+                        if (groupLoc == null && bnds != null) {
+                            // First member of this floating group — externalize it at the
+                            // JIDE-saved screen-coordinates rectangle. Remember the location
+                            // so the other members can stack on it.
+                            groupLoc = bibliothek.gui.dock.common.CLocation.external(
+                                    bnds[0], bnds[1], bnds[2], bnds[3]);
+                            d.setLocation(groupLoc);
+                            groupExternalLocation.put(groupLeader, groupLoc);
+                        } else if (groupLoc != null) {
+                            // Subsequent member — tab onto the leader's external window. Cast
+                            // is safe: CLocation.external returns a CExternalizedLocation,
+                            // which extends AbstractStackholdingLocation and exposes .stack().
+                            if (groupLoc instanceof bibliothek.gui.dock.common.location.AbstractStackholdingLocation) {
+                                d.setLocation(((bibliothek.gui.dock.common.location.AbstractStackholdingLocation) groupLoc).stack());
+                            }
                         }
                         d.setExtendedMode(bibliothek.gui.dock.common.mode.ExtendedMode.EXTERNALIZED);
                         externalized++;
+                        if (firstFloating == null) {
+                            firstFloating = d;
+                        }
                         break;
                     case JideLayoutImporter.MODE_DOCKED:
                     default:
@@ -357,6 +402,29 @@ public class DefaultDockingManager implements DockingManager {
         }
         logger.info("JIDE mode application: {} minimized, {} externalized, {} skipped",
                 minimized, externalized, skipped);
+
+        // Floating group display fix-up: explicit toFront on the first floating panel,
+        // followed by a deferred validate on its window, to make the tab strip render
+        // properly. Without this, only the last-externalized member appears as the active
+        // tab and the others' tabs aren't drawn until the user interacts.
+        if (firstFloating != null) {
+            final bibliothek.gui.dock.common.DefaultSingleCDockable front = firstFloating;
+            SwingUtilities.invokeLater(() -> {
+                try {
+                    front.toFront();
+                    final java.awt.Component c = front.getContentPane();
+                    if (c != null) {
+                        java.awt.Window w = SwingUtilities.getWindowAncestor(c);
+                        if (w != null) {
+                            w.validate();
+                            w.repaint();
+                        }
+                    }
+                } catch (RuntimeException ex) {
+                    logger.debug("Could not refresh floating-group front tab: {}", ex.toString());
+                }
+            });
+        }
     }
 
     @Override
@@ -438,21 +506,27 @@ public class DefaultDockingManager implements DockingManager {
             if (eastFront != null) originalFronts.add(dockables.get(eastFront.getKey()));
 
             // Cycle through every dockable so each gets one moment as the active tab.
-            // CAVEAT: skip MINIMIZED dockables. Calling toFront() on a minimized dockable
-            // pops its flap open — which would make autohide panels show fully expanded
-            // immediately after import (the "Tools opens huge by default" bug in the first
-            // visual test). Minimized dockables don't have stale scrollpane caches to fix
-            // because their JScrollPanes were never laid out against a real viewport in the
-            // first place; they'll be laid out the first time the user clicks the side tab.
+            // CAVEAT: skip MINIMIZED dockables — toFront() on a minimized dockable pops its
+            // flap fully open. Skip EXTERNALIZED dockables too — toFront() across an
+            // externalized tab-stack would arbitrarily promote whichever one happens to be
+            // last in our iteration order. The "make this floating panel the active tab"
+            // decision is made explicitly in applyJideModesPostDeploy, not here.
+            // Normal docked tab-stacks DO need the toFront cycle to fix stale JScrollPane
+            // preferred-size caching (panels born at the back never got their scroll panes
+            // laid out against a real viewport width).
             for (DefaultSingleCDockable d : dockables.values()) {
-                if (d.getExtendedMode() == bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED) {
+                final bibliothek.gui.dock.common.mode.ExtendedMode mode = d.getExtendedMode();
+                if (mode == bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED
+                        || mode == bibliothek.gui.dock.common.mode.ExtendedMode.EXTERNALIZED) {
                     continue;
                 }
                 d.toFront();
             }
-            // Restore the originally-fronting tabs.
+            // Restore the originally-fronting tabs (docked panels only).
             for (DefaultSingleCDockable d : originalFronts) {
-                if (d.getExtendedMode() != bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED) {
+                final bibliothek.gui.dock.common.mode.ExtendedMode mode = d.getExtendedMode();
+                if (mode != bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED
+                        && mode != bibliothek.gui.dock.common.mode.ExtendedMode.EXTERNALIZED) {
                     d.toFront();
                 }
             }
@@ -530,6 +604,24 @@ public class DefaultDockingManager implements DockingManager {
 
     private static int distinctIndices(List<DockableFrame> frames) {
         return (int) frames.stream().mapToInt(DockableFrame::getInitIndex).distinct().count();
+    }
+
+    /**
+     * Map a panel's parsed-JIDE side onto the DockingFrames flap location that puts the
+     * minimized side-tab on the matching edge of the workspace. Without this, DockingFrames
+     * picks "the nearest flap" heuristically, which for a dockable at grid origin (0, 0)
+     * ends up being the NORTH flap (full app width, under the toolbar) — not the WEST flap
+     * where the user originally had Tools docked.
+     */
+    private static bibliothek.gui.dock.common.CLocation flapLocationFor(
+            JideLayoutImporter.FramePlacement placement) {
+        switch (placement.toDockContextSide()) {
+            case DockContext.DOCK_SIDE_EAST:  return bibliothek.gui.dock.common.CLocation.base().minimalEast();
+            case DockContext.DOCK_SIDE_NORTH: return bibliothek.gui.dock.common.CLocation.base().minimalNorth();
+            case DockContext.DOCK_SIDE_SOUTH: return bibliothek.gui.dock.common.CLocation.base().minimalSouth();
+            case DockContext.DOCK_SIDE_WEST:
+            default:                          return bibliothek.gui.dock.common.CLocation.base().minimalWest();
+        }
     }
 
     /** Does this container's tree already include a JScrollPane? */
