@@ -328,6 +328,19 @@ public class DefaultDockingManager implements DockingManager {
                         minimized++;
                         break;
                     case JideLayoutImporter.MODE_FLOATING:
+                        // For FLOATING panels, pre-position the external window before flipping
+                        // mode so it lands at the JIDE-saved location instead of DockingFrames'
+                        // default centre-ish drop spot. CLocation.external accepts screen-coords
+                        // x/y plus width/height; the parser pulled them from the panel's first
+                        // per-mode sub-record. Members of the same floating group all carry the
+                        // same bounds (we read them per-panel; the values match), so each call
+                        // ends up requesting the same position — the second and third effectively
+                        // merge into the first one's external window via DockingFrames' grouping.
+                        final int[] bounds = e.getValue().floatingBounds;
+                        if (bounds != null) {
+                            d.setLocation(bibliothek.gui.dock.common.CLocation.external(
+                                    bounds[0], bounds[1], bounds[2], bounds[3]));
+                        }
                         d.setExtendedMode(bibliothek.gui.dock.common.mode.ExtendedMode.EXTERNALIZED);
                         externalized++;
                         break;
@@ -376,15 +389,23 @@ public class DefaultDockingManager implements DockingManager {
         west.sort(byIndex);
         east.sort(byIndex);
 
+        // ---- Coordinate scheme ---------------------------------------------------------------
+        // West is laid out vertically: a single column at x=0 with each distinct initIndex
+        //   getting its own row top-to-bottom (lower index = top). This matches release WP
+        //   visible layout, where Tool Settings sits above Terrain when both are docked on
+        //   the west.
+        // East gets one column PER distinct initIndex laid out horizontally: lower index =
+        //   further right (outer edge), higher index = closer to the workspace. This matches
+        //   release WP's east arrangement, where Brushes (index 1) is at the far right and
+        //   Info+BrushSettings (index 2) sit closer to the map.
+        // Workspace occupies columns 1..4 (a generous 4-column-wide centre); east columns
+        //   start at x=5 and continue outwards.
+        // Same-index frames stack as tabs in the same cell — that's how Info and Brush
+        //   Settings (both EAST, index=2) come back as a tab-pair.
         CGrid grid = new CGrid(control);
 
-        // Coordinate scheme: the centre is wide; each side gets one column.
-        //   x = 0   : west column
-        //   x = 1-4 : centre (workspace)
-        //   x = 5   : east column
-        // Within a column we give each unique index its own row; multiple frames sharing the same
-        // index will stack as tabs in the same cell.
-        layoutColumn(grid, west, 0);
+        layoutWestColumn(grid, west, 0);
+
         DefaultSingleCDockable workspaceDockable = new DefaultSingleCDockable(WORKSPACE_ID, "Map", workspace);
         workspaceDockable.setCloseable(false);
         workspaceDockable.setMaximizable(true);
@@ -393,7 +414,8 @@ public class DefaultDockingManager implements DockingManager {
         workspaceDockable.setTitleShown(false);
         int rows = Math.max(Math.max(distinctIndices(west), distinctIndices(east)), 1);
         grid.add(1, 0, 4, rows, workspaceDockable);
-        layoutColumn(grid, east, 5);
+
+        layoutEastColumns(grid, east, /* startX = */ 5);
 
         control.getContentArea().deploy(grid);
         layoutDeployed = true;
@@ -416,24 +438,37 @@ public class DefaultDockingManager implements DockingManager {
             if (eastFront != null) originalFronts.add(dockables.get(eastFront.getKey()));
 
             // Cycle through every dockable so each gets one moment as the active tab.
+            // CAVEAT: skip MINIMIZED dockables. Calling toFront() on a minimized dockable
+            // pops its flap open — which would make autohide panels show fully expanded
+            // immediately after import (the "Tools opens huge by default" bug in the first
+            // visual test). Minimized dockables don't have stale scrollpane caches to fix
+            // because their JScrollPanes were never laid out against a real viewport in the
+            // first place; they'll be laid out the first time the user clicks the side tab.
             for (DefaultSingleCDockable d : dockables.values()) {
+                if (d.getExtendedMode() == bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED) {
+                    continue;
+                }
                 d.toFront();
             }
             // Restore the originally-fronting tabs.
             for (DefaultSingleCDockable d : originalFronts) {
-                d.toFront();
+                if (d.getExtendedMode() != bibliothek.gui.dock.common.mode.ExtendedMode.MINIMIZED) {
+                    d.toFront();
+                }
             }
         });
     }
 
-    private void layoutColumn(CGrid grid, List<DockableFrame> column, int x) {
-        // Frames sharing an initIndex become tabs in the same grid cell — matches JIDE's grouping
-        // and keeps each cell tall enough to be useful (giving every frame its own row makes the
-        // panels too cramped on typical monitors).
+    /**
+     * Lay out the west side as a single column at {@code x} with each distinct {@code initIndex}
+     * stacked top-to-bottom (lower index = top). Same-index frames become tabs in the same cell.
+     * Matches release WP's visible west arrangement (Tool Settings on top, Terrain below it).
+     */
+    private void layoutWestColumn(CGrid grid, List<DockableFrame> frames, int x) {
         int row = 0;
         Integer prevIndex = null;
         List<DefaultSingleCDockable> currentCell = new ArrayList<>();
-        for (DockableFrame f : column) {
+        for (DockableFrame f : frames) {
             DefaultSingleCDockable d = wrap(f);
             dockables.put(f.getKey(), d);
             if (prevIndex != null && f.getInitIndex() != prevIndex) {
@@ -445,6 +480,51 @@ public class DefaultDockingManager implements DockingManager {
         }
         if (!currentCell.isEmpty()) {
             grid.add(x, row, 1, 1, currentCell.toArray(new DefaultSingleCDockable[0]));
+        }
+    }
+
+    /**
+     * Lay out the east side as multiple columns starting at {@code startX}, one column per
+     * distinct {@code initIndex}: lower index → further right (outer), higher index → closer to
+     * the workspace (inner). Same-index frames tab-stack within the cell at that column. Matches
+     * release WP's east arrangement (Brushes far right; Info+BrushSettings tabbed pair closer
+     * to the map).
+     *
+     * <p>Single-pass: sort the frames by index ascending, then walk them, assigning each
+     * distinct index its own column starting from the outermost. The {@code frames} list is
+     * already sorted by {@code initIndex} ascending by the caller.
+     */
+    private void layoutEastColumns(CGrid grid, List<DockableFrame> frames, int startX) {
+        if (frames.isEmpty()) return;
+        // Count distinct indices to know how many east columns we'll need.
+        final java.util.SortedSet<Integer> distinctIndices = new java.util.TreeSet<>();
+        for (DockableFrame f : frames) distinctIndices.add(f.getInitIndex());
+        final int columnCount = distinctIndices.size();
+
+        // Assign each distinct index to an x: ascending index → descending x (outer-first).
+        // First (lowest) index gets the outermost x (= startX + columnCount - 1); last (highest)
+        // gets startX itself, adjacent to the workspace.
+        final java.util.Map<Integer, Integer> indexToX = new java.util.HashMap<>();
+        int xPos = startX + columnCount - 1;
+        for (Integer idx : distinctIndices) {
+            indexToX.put(idx, xPos--);
+        }
+
+        // Group frames by index and add each group as a separate cell at its assigned x.
+        Integer prevIndex = null;
+        List<DefaultSingleCDockable> currentCell = new ArrayList<>();
+        for (DockableFrame f : frames) {
+            DefaultSingleCDockable d = wrap(f);
+            dockables.put(f.getKey(), d);
+            if (prevIndex != null && f.getInitIndex() != prevIndex) {
+                grid.add(indexToX.get(prevIndex), 0, 1, 1, currentCell.toArray(new DefaultSingleCDockable[0]));
+                currentCell.clear();
+            }
+            currentCell.add(d);
+            prevIndex = f.getInitIndex();
+        }
+        if (!currentCell.isEmpty()) {
+            grid.add(indexToX.get(prevIndex), 0, 1, 1, currentCell.toArray(new DefaultSingleCDockable[0]));
         }
     }
 

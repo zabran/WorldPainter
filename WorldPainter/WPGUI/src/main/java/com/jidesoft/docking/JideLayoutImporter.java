@@ -86,13 +86,23 @@ public final class JideLayoutImporter {
          * these ids back to panel keys via {@link #findPanelKeyById}.
          */
         public final int[] groupMemberIds;
+        /**
+         * For {@code MODE_FLOATING} panels, the screen-coordinates rectangle of the floating
+         * window: {@code [x, y, width, height]}. Pulled from the first per-mode sub-record
+         * inside the panel's record (immediately after the panel id, which is repeated as a
+         * sub-record marker). All members of a floating group share the same rectangle (we
+         * read it once per panel; the values match). {@code null} when unavailable or when
+         * the panel isn't floating.
+         */
+        public final int[] floatingBounds;
 
-        FramePlacement(int jideSide, int index, int mode, int id, int[] groupMemberIds) {
+        FramePlacement(int jideSide, int index, int mode, int id, int[] groupMemberIds, int[] floatingBounds) {
             this.jideSide = jideSide;
             this.index = index;
             this.mode = mode;
             this.id = id;
             this.groupMemberIds = groupMemberIds != null ? groupMemberIds : new int[0];
+            this.floatingBounds = floatingBounds;
         }
         /** Translate the JIDE bitmask to our adapter's {@link DockContext} constant. */
         public int toDockContextSide() {
@@ -196,12 +206,21 @@ public final class JideLayoutImporter {
             // the next int is the count, followed by `count` member ids.
             final int[] groupIds = findGroupMembers(b, idOff + 28, nextPanelKeyOff);
 
+            // For FLOATING panels, also extract the floating-window geometry. The first
+            // sub-record inside the panel's data block starts where the panel's own id is
+            // repeated (acts as a sub-record marker), followed by an int tag and four ints
+            // (x, y, width, height in screen coordinates).
+            final int[] floatingBounds = (isValidMode(mode) ? mode : MODE_DOCKED) == MODE_FLOATING
+                    ? findFloatingBounds(b, idOff + 28, nextPanelKeyOff, id)
+                    : null;
+
             placements.put(panelKeys.get(p), new FramePlacement(side, index,
-                    isValidMode(mode) ? mode : MODE_DOCKED, id, groupIds));
-            logger.debug("JIDE import: '{}' → side=0x{} index={} mode={} id=0x{} group={}",
+                    isValidMode(mode) ? mode : MODE_DOCKED, id, groupIds, floatingBounds));
+            logger.debug("JIDE import: '{}' → side=0x{} index={} mode={} id=0x{} group={} bounds={}",
                     panelKeys.get(p), Integer.toHexString(side), index,
                     modeName(isValidMode(mode) ? mode : MODE_DOCKED),
-                    Integer.toHexString(id), java.util.Arrays.toString(groupIds));
+                    Integer.toHexString(id), java.util.Arrays.toString(groupIds),
+                    java.util.Arrays.toString(floatingBounds));
         }
 
         if (placements.isEmpty()) {
@@ -244,6 +263,43 @@ public final class JideLayoutImporter {
      * DOCKED tab-stacks, which use shared (side, index) rather than the marker), returns an
      * empty array.
      */
+    /**
+     * Find the floating-window geometry inside a panel's record. The first per-mode sub-record
+     * starts where the panel's own id is repeated (so the parser can cross-reference back to
+     * the owning panel). Format observed in the worldpainter_2.26.1 sample:
+     *
+     * <pre>
+     *   int  id            ← marker, equal to the panel's id
+     *   int  modeTag       ← we skip (observed: 2)
+     *   int  x             ← screen-coords of the floating window
+     *   int  y
+     *   int  width
+     *   int  height
+     * </pre>
+     *
+     * @return a 4-element {@code [x, y, w, h]} array, or {@code null} if the marker can't be
+     *     found within the search range or there isn't enough data after it.
+     */
+    private static int[] findFloatingBounds(byte[] b, int searchStart, int searchEnd, int panelId) {
+        final int safeEnd = Math.min(searchEnd, b.length);
+        for (int off = searchStart; off + 24 <= safeEnd; off += 4) {
+            if (readIntBE(b, off) == panelId) {
+                // Found the sub-record start. Skip the id and the 1-int mode tag, then read xywh.
+                final int x = readIntBE(b, off + 8);
+                final int y = readIntBE(b, off + 12);
+                final int w = readIntBE(b, off + 16);
+                final int h = readIntBE(b, off + 20);
+                // Sanity: only accept plausible screen coords (drop the "preferred size" sub-record
+                // that some panels also include — that one has x=0,y=0 and large w/h matching the
+                // workspace bounds).
+                if (x > 0 && y > 0 && w > 0 && h > 0 && w < 10_000 && h < 10_000) {
+                    return new int[]{x, y, w, h};
+                }
+            }
+        }
+        return null;
+    }
+
     private static int[] findGroupMembers(byte[] b, int searchStart, int searchEnd) {
         final int safeEnd = Math.min(searchEnd, b.length);
         for (int off = searchStart; off + 8 <= safeEnd; off += 4) {
