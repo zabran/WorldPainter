@@ -29,6 +29,7 @@ import org.pepsoft.worldpainter.layers.exporters.ExporterSettings;
 import org.pepsoft.worldpainter.layers.exporters.ResourcesExporter.ResourcesExporterSettings;
 import org.pepsoft.worldpainter.layers.tunnel.TunnelLayer;
 import org.pepsoft.worldpainter.operations.Filter;
+import org.pepsoft.worldpainter.paging.PagingTileMap;
 import org.pepsoft.worldpainter.panels.DefaultFilter;
 import org.pepsoft.worldpainter.selection.SelectionBlock;
 import org.pepsoft.worldpainter.selection.SelectionChunk;
@@ -2747,7 +2748,11 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
         writeLock = lock.writeLock();
 
         if (tiles == null) {
-            tiles = new HashMap<>();
+            tiles = new PagingTileMap();
+        } else if (!(tiles instanceof PagingTileMap)) {
+            // Legacy GZIP-ObjectStream saves contain a plain HashMap. Wrap it so future code
+            // paths see a consistent PagingTileMap type.
+            tiles = new PagingTileMap(tiles);
         }
         for (Tile tile: tiles.values()) {
             tile.addListener(this);
@@ -2960,7 +2965,7 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
     private final long seed;
     @Deprecated
     private int dim = 0;
-    Map<Point, Tile> tiles = new HashMap<>();
+    Map<Point, Tile> tiles = new PagingTileMap();
     private final TileFactory tileFactory;
     private int lowestX = Integer.MAX_VALUE, highestX = Integer.MIN_VALUE, lowestY = Integer.MAX_VALUE, highestY = Integer.MIN_VALUE;
     private Terrain subsurfaceMaterial = Terrain.STONE_MIX;
