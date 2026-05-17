@@ -2515,10 +2515,17 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
      * {@link DataOutputStream#writeInt}).
      */
     public void writeTileIndexPayload(OutputStream out) throws IOException {
+        writeTileIndexPayload(tiles.keySet(), out);
+    }
+
+    /**
+     * Same as the instance method but acts on an arbitrary {@code Set<Point>} — used in unit
+     * tests that need to exercise the writer without standing up a full {@link Dimension}.
+     */
+    public static void writeTileIndexPayload(Set<Point> coords, OutputStream out) throws IOException {
         final DataOutputStream dout = new DataOutputStream(out);
         dout.writeInt(TILE_INDEX_MAGIC);
         dout.writeInt(TILE_INDEX_VERSION);
-        final Set<Point> coords = tiles.keySet();
         dout.writeInt(coords.size());
         for (Point p : coords) {
             dout.writeInt(p.x);
