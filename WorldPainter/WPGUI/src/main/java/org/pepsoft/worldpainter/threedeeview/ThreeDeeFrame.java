@@ -104,7 +104,20 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
                 ThreeDeeFrame.this.setAlwaysOnTop(false);
             }
         });
-        
+
+        // C1: master toggle for the tile-cache optimisations. Default on (sticky across opens
+        // via lastCachingEnabled). Unchecking flushes the rendered-tile cache, asks B-mode to
+        // evict regions outside the budget, and disables the C1 paint optimisations going
+        // forward. Visible tiles will re-render at the next paint.
+        cacheCheckBox.setToolTipText("<html>When on, all rendered tiles are kept cached (no RAM cap). When off, the cache is limited to the 2000 least-recently-used tiles (~720 MB) and tiles outside that window re-render when revisited. The currently visible viewport is protected from eviction.</html>");
+        cacheCheckBox.addActionListener(e -> {
+            cachingEnabled = cacheCheckBox.isSelected();
+            lastCachingEnabled = cachingEnabled;
+            if (threeDeeView != null) {
+                threeDeeView.setCachingEnabled(cachingEnabled);
+            }
+        });
+
         JToolBar toolBar = new JToolBar();
         toolBar.setFloatable(false);
         toolBar.add(alwaysOnTopButton);
@@ -131,6 +144,10 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
         final JRadioButton radioButtonLayersAll = new JRadioButton(SURFACE_LAYERS_ACTION);
         layerVisibilityButtonGroup.add(radioButtonLayersAll);
         toolBar.add(radioButtonLayersAll);
+        // C1: push the cache checkbox to the right end of the toolbar with a separator before it.
+        toolBar.add(Box.createHorizontalGlue());
+        toolBar.addSeparator();
+        toolBar.add(cacheCheckBox);
         getContentPane().add(toolBar, BorderLayout.NORTH);
 
         glassPane = new GlassPane();
@@ -166,14 +183,34 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
 
     public final void setDimension(Dimension dimension) {
         this.dimension = dimension;
+        // C1: explicit cleanup of the OLD view before replacing it. setViewportView
+        // alone removes it from the scroll pane but doesn't always trigger eager
+        // release of its rendered-tile cache in all reachability conditions.
+        if (threeDeeView != null) {
+            threeDeeView.disposeResources();
+        }
         if (dimension != null) {
             threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom);
             threeDeeView.setLayerVisibility(layerVisibility);
             threeDeeView.setHiddenLayers(hiddenLayers);
+            threeDeeView.setCachingEnabled(cachingEnabled);
             scrollPane.setViewportView(threeDeeView);
             MOVE_TO_SPAWN_ACTION.setEnabled(dimension.getAnchor().equals((dimension.getWorld().getSpawnPointDimension() == null) ? NORMAL_DETAIL : dimension.getWorld().getSpawnPointDimension()));
             glassPane.setRotation(DIRECTIONS[rotation], dimension.getAnchor().invert);
         }
+    }
+
+    /**
+     * C1: explicit cleanup before native peer disposal. Frees the rendered-tile
+     * cache eagerly so that even if some Swing/AWT internal still holds the
+     * ThreeDeeView briefly, the BufferedImages it pinned are already gone.
+     */
+    @Override
+    public void dispose() {
+        if (threeDeeView != null) {
+            threeDeeView.disposeResources();
+        }
+        super.dispose();
     }
 
     public void setHiddenLayers(Set<Layer> hiddenLayers) {
@@ -231,7 +268,7 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
         {
             setShortDescription("Rotate the view 90 degrees anticlockwise (l)");
         }
-        
+
         @Override
         public void performAction(ActionEvent e) {
             rotation--;
@@ -240,24 +277,27 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
             }
             final Tile centreMostTile = threeDeeView.getCentreMostTile();
             if (centreMostTile != null) {
+                // C1: release the OLD view's caches before swapping in the new one.
+                threeDeeView.disposeResources();
                 threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom);
                 threeDeeView.setLayerVisibility(layerVisibility);
                 threeDeeView.setHiddenLayers(hiddenLayers);
+                threeDeeView.setCachingEnabled(cachingEnabled);
                 scrollPane.setViewportView(threeDeeView);
 //                scrollPane.getViewport().setViewPosition(new Point((threeDeeView.getWidth() - scrollPane.getWidth()) / 2, (threeDeeView.getHeight() - scrollPane.getHeight()) / 2));
                 threeDeeView.moveToTile(centreMostTile);
                 glassPane.setRotation(DIRECTIONS[rotation], dimension.getAnchor().invert);
             }
         }
-        
+
         private static final long serialVersionUID = 1L;
     };
-    
+
     private final Action ROTATE_RIGHT_ACTION = new BetterAction("rotate3DViewRight", "Rotate right", ICON_ROTATE_RIGHT) {
         {
             setShortDescription("Rotate the view 90 degrees clockwise (r)");
         }
-        
+
         @Override
         public void performAction(ActionEvent e) {
             rotation++;
@@ -266,16 +306,19 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
             }
             final Tile centreMostTile = threeDeeView.getCentreMostTile();
             if (centreMostTile != null) {
+                // C1: release the OLD view's caches before swapping in the new one.
+                threeDeeView.disposeResources();
                 threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom);
                 threeDeeView.setLayerVisibility(layerVisibility);
                 threeDeeView.setHiddenLayers(hiddenLayers);
+                threeDeeView.setCachingEnabled(cachingEnabled);
                 scrollPane.setViewportView(threeDeeView);
 //                scrollPane.getViewport().setViewPosition(new Point((threeDeeView.getWidth() - scrollPane.getWidth()) / 2, (threeDeeView.getHeight() - scrollPane.getHeight()) / 2));
                 threeDeeView.moveToTile(centreMostTile);
                 glassPane.setRotation(DIRECTIONS[rotation], dimension.getAnchor().invert);
             }
         }
-        
+
         private static final long serialVersionUID = 1L;
     };
 
@@ -508,6 +551,8 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
     private final CustomBiomeManager customBiomeManager;
     private final ButtonGroup layerVisibilityButtonGroup = new ButtonGroup();
     final JToggleButton alwaysOnTopButton = new JToggleButton(ICON_ALWAYS_ON_TOP);
+    /** C1: toolbar checkbox for the tile-cache optimisations on the active ThreeDeeView. */
+    final JCheckBox cacheCheckBox = new JCheckBox("Cache tiles", lastCachingEnabled);
     private Dimension dimension;
     private ThreeDeeView threeDeeView;
     private ColourScheme colourScheme;
@@ -515,6 +560,16 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
     private Point coords;
     private LayerVisibilityMode layerVisibility = SURFACE;
     private Set<Layer> hiddenLayers;
+    /** C1: master cache-on flag mirrored to every new ThreeDeeView created by this frame. */
+    private boolean cachingEnabled = lastCachingEnabled;
+
+    /**
+     * C1: last value of {@link #cachingEnabled} from any ThreeDeeFrame this JVM has shown.
+     * New frames pick up this value so the checkbox state persists across close + reopen.
+     * In-memory only; not written to Configuration (3D view caching is a session preference,
+     * not a saved one).
+     */
+    private static boolean lastCachingEnabled = true;
     
     private static final Direction[] DIRECTIONS = {Direction.EAST, Direction.SOUTH, Direction.WEST, Direction.NORTH};
     

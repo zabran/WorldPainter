@@ -2384,6 +2384,18 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
         return null;
     }
 
+    /**
+     * Ask the lazy pager (if any) to evict resident regions back to its budget. Useful after a
+     * bulk-loading caller (e.g. a 3D view session) releases its strong references — without
+     * this the resident map stays fat until the next miss happens to push it over budget.
+     * No-op in eager mode.
+     */
+    public void trimResidentTilesToBudget() {
+        if (tiles instanceof PagingTileMap) {
+            ((PagingTileMap) tiles).trimResidentToBudget();
+        }
+    }
+
     public void save(ZipOutputStream out) throws IOException {
         readLock.lock();
         try {

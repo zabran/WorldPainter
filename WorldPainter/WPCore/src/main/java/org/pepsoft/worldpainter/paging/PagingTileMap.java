@@ -116,6 +116,17 @@ public class PagingTileMap implements Map<Point, Tile>, Serializable {
         return resident.size();
     }
 
+    /**
+     * Ask the pager to enforce its region budget against the current resident set. Used by
+     * callers (notably the 3D view's close path) that bulk-loaded the dimension and want the
+     * budget re-applied once they release their strong references. No-op in eager mode.
+     */
+    public void trimResidentToBudget() {
+        if (pager != null) {
+            pager.trimResidentToBudget(resident);
+        }
+    }
+
     // --- Map<Point, Tile> ---
 
     @Override

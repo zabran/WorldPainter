@@ -55,4 +55,12 @@ public interface TilePager {
 
     /** Release any held file handles. */
     void close();
+
+    /**
+     * Force the resident set down to the pager's region budget. Called by callers who have
+     * temporarily fattened the resident set with a bulk operation (e.g. a 3D-view session
+     * that needed every tile loaded) and want the budget re-enforced once the bulk caller
+     * has released its strong references. No-op for pagers that don't enforce a budget.
+     */
+    default void trimResidentToBudget(Map<Point, Tile> resident) { }
 }

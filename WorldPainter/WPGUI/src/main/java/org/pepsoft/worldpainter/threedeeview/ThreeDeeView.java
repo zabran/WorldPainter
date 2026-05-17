@@ -53,16 +53,19 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
         }
         upsideDown = dimension.getAnchor().invert; // Ceiling dimension
         zSortedTiles = new TreeMap<>();
+        // C1: single pass over dimension.getTiles() instead of two. Under B-mode (lazy paging)
+        // each pass force-loads every region; doing it twice doubled the open-time RAM cost.
+        // We also track the tiles we're listening to in `listenedTiles` so the close path can
+        // detach listeners without re-iterating dimension.getTiles() (another force-load).
         for (Tile tile: dimension.getTiles()) {
             final Rectangle tileBaseBounds = getTileBounds(tile.getX(), tile.getY(), 0, 0, 0);
             zSortedTiles.computeIfAbsent(tileBaseBounds.y, y -> new TreeMap<>()).put(tileBaseBounds.x, tile);
+            tile.addListener(this);
+            listenedTiles.add(tile);
         }
         threeDeeRenderManager = new ThreeDeeRenderManager(dimension, colourScheme, customBiomeManager, rotation);
 
         dimension.addDimensionListener(this);
-        for (Tile tile: dimension.getTiles()) {
-            tile.addListener(this);
-        }
 
         int width = dimension.getWidth() * TILE_SIZE + dimension.getHeight() * TILE_SIZE;
         int height = width / 2 + maxHeight - minHeight - 1;
@@ -196,6 +199,67 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
         repaint();
     }
 
+    /**
+     * Whether the C1 tile-cache optimisations are active. When true (default), the
+     * paint path keeps rendered tiles in memory across paints, schedules off-screen
+     * margin tiles for pre-render, and caches tile bounds. When false, all caches
+     * are flushed and the paint path falls back to the upstream behaviour: tiles
+     * are rendered on demand only, no pre-render, no bounds cache. Useful as an
+     * escape hatch if caching ever misbehaves on a particular world.
+     */
+    public boolean isCachingEnabled() {
+        return cachingEnabled;
+    }
+
+    public void setCachingEnabled(boolean cachingEnabled) {
+        if (this.cachingEnabled != cachingEnabled) {
+            this.cachingEnabled = cachingEnabled;
+            if (! cachingEnabled) {
+                // Trim the rendered-tile cache down to the bounded cap. Keeps the most
+                // recently inserted tiles (LinkedHashMap insertion order ≈ recency of
+                // render for a panning user), so the visible viewport usually survives
+                // and only "stale" off-screen tiles are evicted. Going forward, new
+                // inserts will trigger LinkedHashMap's removeEldestEntry hook to keep
+                // the map at the cap.
+                final int before = renderedTiles.size();
+                trimRenderedTilesToCap();
+                flushAndClear(dirtyTiles);
+                tilesWaitingToBeRendered.clear();
+                dimension.trimResidentTilesToBudget();
+                if (logger.isInfoEnabled()) {
+                    logger.info("ThreeDeeView.setCachingEnabled(false): trimmed renderedTiles {} -> {} (cap {})",
+                            before, renderedTiles.size(), BOUNDED_CACHE_TILES);
+                }
+                repaint();
+            } else {
+                if (logger.isInfoEnabled()) {
+                    logger.info("ThreeDeeView.setCachingEnabled(true): unlimited cache resumes (currently {} entries)",
+                            renderedTiles.size());
+                }
+            }
+        }
+    }
+
+    /**
+     * Evict oldest LinkedHashMap entries from renderedTiles until size <= BOUNDED_CACHE_TILES.
+     * Called on toggle-off; the {@code removeEldestEntry} override handles steady-state
+     * eviction after that.
+     */
+    private void trimRenderedTilesToCap() {
+        if (renderedTiles.size() <= BOUNDED_CACHE_TILES) {
+            return;
+        }
+        final Iterator<Map.Entry<Tile, BufferedImage>> it = renderedTiles.entrySet().iterator();
+        while (it.hasNext() && renderedTiles.size() > BOUNDED_CACHE_TILES) {
+            final Map.Entry<Tile, BufferedImage> e = it.next();
+            final BufferedImage img = e.getValue();
+            if (img != null && img != TILE_NOT_RENDERABLE) {
+                img.flush();
+            }
+            it.remove();
+        }
+    }
+
     public void setLayerVisibility(LayerVisibilityMode layerVisibility) {
         if (layerVisibility != this.layerVisibility) {
             this.layerVisibility = layerVisibility;
@@ -261,6 +325,7 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
             final Rectangle tileBaseBounds = getTileBounds(tile.getX(), tile.getY(), 0, 0, 0);
             zSortedTiles.computeIfAbsent(tileBaseBounds.y, y -> new TreeMap<>()).put(tileBaseBounds.x, tile);
             tile.addListener(this);
+            listenedTiles.add(tile);
         });
     }
 
@@ -268,10 +333,12 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     public void tilesRemoved(Dimension dimension, Set<Tile> tiles) {
         for (Tile tile: tiles) {
             tile.removeListener(this);
+            listenedTiles.remove(tile);
             final Rectangle tileBaseBounds = getTileBounds(tile.getX(), tile.getY(), 0, 0, 0);
             if (zSortedTiles.containsKey(tileBaseBounds.y)) {
                 zSortedTiles.get(tileBaseBounds.y).remove(tileBaseBounds.x);
             }
+            tileBoundsCache.remove(tile);
         }
 //        renderedTiles.remove(new Point(tile.getX(), tile.getY()));
         // TODO: the tile will be re-added if it was on the render queue, but
@@ -286,21 +353,25 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     
     @Override
     public void heightMapChanged(Tile tile) {
+        tileBoundsCache.remove(tile);
         scheduleTileForRendering(tile);
     }
 
     @Override
     public void terrainChanged(Tile tile) {
+        tileBoundsCache.remove(tile);
         scheduleTileForRendering(tile);
     }
 
     @Override
     public void waterLevelChanged(Tile tile) {
+        tileBoundsCache.remove(tile);
         scheduleTileForRendering(tile);
     }
 
     @Override
     public void seedsChanged(Tile tile) {
+        tileBoundsCache.remove(tile);
         scheduleTileForRendering(tile);
     }
 
@@ -318,16 +389,18 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
 
     @Override
     public void allBitLayerDataChanged(Tile tile) {
+        tileBoundsCache.remove(tile);
         scheduleTileForRendering(tile);
     }
 
     @Override
     public void allNonBitlayerDataChanged(Tile tile) {
+        tileBoundsCache.remove(tile);
         scheduleTileForRendering(tile);
     }
 
     // HierarchyListener
-    
+
     @Override
     public void hierarchyChanged(HierarchyEvent event) {
         if ((event.getChangeFlags() & HierarchyEvent.DISPLAYABILITY_CHANGED) != 0) {
@@ -338,15 +411,69 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
                 timer = new Timer(250, this);
                 timer.start();
             } else {
-                timer.stop();
-                timer = null;
-                threeDeeRenderManager.stop();
-                for (Tile tile : dimension.getTiles()) {
-                    tile.removeListener(this);
-                }
-                dimension.removeDimensionListener(this);
+                disposeResources();
             }
         }
+    }
+
+    /**
+     * Eagerly release all heavy caches and detach listeners. Safe to call multiple
+     * times. Called from hierarchyChanged when the view becomes non-displayable
+     * (e.g. frame closed), and may also be called explicitly by ThreeDeeFrame
+     * before disposal.
+     *
+     * The 3D view's open path bulk-loads every tile in the dimension twice (once for
+     * zSortedTiles, once to attach listeners — now combined into a single pass).
+     * Under B-mode (lazy region paging) those loads fill the resident map past the
+     * configured budget; eviction only runs on subsequent loads, so the resident
+     * stays fat until something forces a miss. This method:
+     *   1. Stops the timer and the render manager (no more async work scheduled).
+     *   2. Detaches Tile.Listener and Dimension.Listener using our own
+     *      {@code listenedTiles} set, NOT {@code dimension.getTiles()} — the
+     *      latter would itself force-load every tile, redoing the open-time cost
+     *      on close.
+     *   3. Flushes every cached BufferedImage to release its accelerated pixel
+     *      backing on platforms where that's separate from the Java heap.
+     *   4. Clears every internal cache so the view stops pinning Tile references.
+     *   5. Asks the dimension to trim its resident-region set back to the budget
+     *      now that the 3D view's strong references are gone. Without this the
+     *      ~1.7 GB of tile data we bulk-loaded would sit in B-mode's resident map
+     *      until the next eviction trigger.
+     */
+    public void disposeResources() {
+        final int beforeRendered = renderedTiles.size();
+        final int beforeListened = listenedTiles.size();
+        final int beforeBounds = tileBoundsCache.size();
+        if (timer != null) {
+            timer.stop();
+            timer = null;
+        }
+        threeDeeRenderManager.stop();
+        for (Tile tile : listenedTiles) {
+            tile.removeListener(this);
+        }
+        listenedTiles.clear();
+        dimension.removeDimensionListener(this);
+        flushAndClear(renderedTiles);
+        flushAndClear(dirtyTiles);
+        tilesWaitingToBeRendered.clear();
+        tileBoundsCache.clear();
+        zSortedTiles.clear();
+        // Trim B-mode resident back to budget. No-op in eager mode.
+        dimension.trimResidentTilesToBudget();
+        if (logger.isInfoEnabled()) {
+            logger.info("ThreeDeeView.disposeResources: freed {} rendered tiles, {} listened tiles, {} cached bounds",
+                    beforeRendered, beforeListened, beforeBounds);
+        }
+    }
+
+    private static void flushAndClear(Map<Tile, BufferedImage> map) {
+        for (BufferedImage img : map.values()) {
+            if (img != null && img != TILE_NOT_RENDERABLE) {
+                img.flush();
+            }
+        }
+        map.clear();
     }
 
     // ActionListener
@@ -416,7 +543,11 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
             if (zoom > 1) {
                 g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
             } else {
-                g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                // C1: BILINEAR for downscale instead of BICUBIC. Bicubic samples 16 source
+                // pixels per output pixel (vs 4 for bilinear) and Java2D's bicubic on
+                // shrink doesn't pre-filter, so it's surprisingly slow at zoom -2 with
+                // many tiles on screen. Bilinear visually fine for Minecraft tile art.
+                g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             }
         }
         if (upsideDown) {
@@ -446,7 +577,14 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
                     }
                     BufferedImage tileImg = renderedTiles.get(tile);
                     if (tileImg == null) {
-                        tilesWaitingToBeRendered.add(0, tile);
+                        if (cachingEnabled) {
+                            // C1: schedule immediately instead of waiting for the 250 ms Timer.
+                            // UniqueJobQueue dedupes, so re-paints during a drag are cheap.
+                            threeDeeRenderManager.renderTile(tile);
+                        } else {
+                            // Upstream behaviour: queue for the Timer to drain.
+                            tilesWaitingToBeRendered.add(0, tile);
+                        }
                         tileImg = dirtyTiles.get(tile);
                     }
                     if (tileImg != null) {
@@ -467,6 +605,39 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
         if (mostCentredTile != null) {
             centreTile = mostCentredTile;
         }
+
+        // C1: pre-render an off-screen margin so panning into fresh tiles
+        // finds them already rendered (or at least already queued). UniqueJobQueue
+        // dedupes, so re-walking on every paint during a drag is cheap.
+        //
+        // Gated to zoom == 1: when zoomed out, the margin (in user-space pixels) is
+        // a small device-space band but covers a large world area — the visible-tile
+        // loop above already queues lots of tiles, and adding margin there floods
+        // the render queue without clear benefit. When zoomed in, the margin is much
+        // larger than necessary. Revisit if smarter scale-aware pre-rendering
+        // becomes worth the complexity.
+        //
+        // Also gated on cachingEnabled so the toolbar toggle can disable pre-render
+        // entirely as an escape hatch.
+        if (cachingEnabled && zoom == 1) {
+            final Rectangle marginBounds = new Rectangle(
+                    clipBounds.x - PRE_RENDER_MARGIN_PX,
+                    clipBounds.y - PRE_RENDER_MARGIN_PX,
+                    clipBounds.width + 2 * PRE_RENDER_MARGIN_PX,
+                    clipBounds.height + 2 * PRE_RENDER_MARGIN_PX);
+            for (SortedMap<Integer, Tile> row: zSortedTiles.subMap(marginBounds.y - yOffset - maxHeight, marginBounds.y + marginBounds.height - yOffset + maxHeight).values()) {
+                for (Tile tile: row.subMap(marginBounds.x - xOffset - TILE_SIZE * 2, marginBounds.x + marginBounds.width - xOffset).values()) {
+                    if (renderedTiles.containsKey(tile)) {
+                        continue;
+                    }
+                    final Rectangle tileBounds = getTileBounds(tile);
+                    if (! tileBounds.intersects(clipBounds) && tileBounds.intersects(marginBounds)) {
+                        threeDeeRenderManager.renderTile(tile);
+                    }
+                }
+            }
+        }
+
         if (highlightTile != null) {
             g2.setColor(Color.RED);
             Rectangle rect = getTileBounds(highlightTile.x, highlightTile.y, maxHeight);
@@ -524,7 +695,27 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     }
 
     private Rectangle getTileBounds(final Tile tile) {
-        return getTileBounds(tile.getX(), tile.getY(), Math.max(tile.getHighestIntHeight(), tile.getHighestWaterLevel()) + 1);
+        // C1: cache per-tile bounds. Computing them touches tile.getHighestIntHeight()
+        // / getHighestWaterLevel(), which under B-mode (lazy paging) may trigger an
+        // archive read. Caching keeps panning off-hot-path; entries are invalidated
+        // in the height-affecting Tile.Listener events below.
+        //
+        // IMPORTANT: this returns a defensive copy because zoom(Rectangle) mutates
+        // its argument in place. Callers like actionPerformed/scheduleTileForRendering
+        // do `zoom(getTileBounds(tile))`; without the copy the cached Rectangle would
+        // be repeatedly scaled and break drawing as soon as zoom != 1.
+        //
+        // Gated on cachingEnabled so the toolbar toggle can fall back to the original
+        // compute-every-time behaviour.
+        if (! cachingEnabled) {
+            return getTileBounds(tile.getX(), tile.getY(), Math.max(tile.getHighestIntHeight(), tile.getHighestWaterLevel()) + 1);
+        }
+        Rectangle cached = tileBoundsCache.get(tile);
+        if (cached == null) {
+            cached = getTileBounds(tile.getX(), tile.getY(), Math.max(tile.getHighestIntHeight(), tile.getHighestWaterLevel()) + 1);
+            tileBoundsCache.put(tile, cached);
+        }
+        return new Rectangle(cached);
     }
 
     private Rectangle getTileBounds(final int x, final int y, final int maxHeight) {
@@ -632,7 +823,39 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     }
 
     private final Dimension dimension;
-    private final Map<Tile, BufferedImage> renderedTiles = new HashMap<>(), dirtyTiles = new HashMap<>();
+    /**
+     * C1: rendered-tile cache with true LRU semantics. When cachingEnabled=false the
+     * removeEldestEntry hook caps the map at {@link #BOUNDED_CACHE_TILES}, evicting the
+     * LEAST RECENTLY USED tile. The {@code accessOrder=true} flag makes every get(tile)
+     * call (e.g. paintComponent looking up a visible tile to draw) move that entry to the
+     * tail, so the visible viewport is naturally protected from eviction — older
+     * off-screen tiles drop out first.
+     * <p>
+     * When cachingEnabled=true (default) the hook returns false and the map grows
+     * unbounded, matching previous behaviour.
+     */
+    private final Map<Tile, BufferedImage> renderedTiles = new LinkedHashMap<Tile, BufferedImage>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Tile, BufferedImage> eldest) {
+            if (! cachingEnabled && size() > BOUNDED_CACHE_TILES) {
+                final BufferedImage img = eldest.getValue();
+                if (img != null && img != TILE_NOT_RENDERABLE) {
+                    img.flush();
+                }
+                return true;
+            }
+            return false;
+        }
+    };
+    private final Map<Tile, BufferedImage> dirtyTiles = new HashMap<>();
+    /** C1: cached per-tile screen-space bounds. Invalidated by height-affecting Tile.Listener events. */
+    private final Map<Tile, Rectangle> tileBoundsCache = new HashMap<>();
+    /**
+     * C1: tiles we've attached a Tile.Listener to. Used by {@link #disposeResources} to detach
+     * the listener on close WITHOUT re-iterating {@code dimension.getTiles()} (which under B-mode
+     * would force-load every region a second time).
+     */
+    private final Set<Tile> listenedTiles = new HashSet<>();
     private final ThreeDeeRenderManager threeDeeRenderManager;
     private final ColourScheme colourScheme;
     private final List<Tile> tilesWaitingToBeRendered = new LinkedList<>();
@@ -650,10 +873,30 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     private Point highlightTile, highlightPoint;
     private LayerVisibilityMode layerVisibility;
     private Set<Layer> hiddenLayers;
+    /** C1: master toggle for the tile-cache optimisations. See setCachingEnabled. */
+    private boolean cachingEnabled = true;
 
     public static final BufferedImage TILE_NOT_RENDERABLE = new BufferedImage(1, 1, TYPE_BYTE_BINARY);
 
-//    private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(ThreeDeeView.class);
+    /**
+     * C1: how far outside the current clip rectangle (in pre-zoom screen pixels) we
+     * pre-render tiles so that panning into them finds them already rendered.
+     * TILE_SIZE * 2 ≈ one tile worth of margin in screen-space — enough to cover a
+     * mouse drag of typical speed without queueing the entire map.
+     */
+    private static final int PRE_RENDER_MARGIN_PX = TILE_SIZE * 2;
+
+    /**
+     * C1: hard cap on cached rendered tiles when the "Cache tiles" checkbox is off.
+     * 2000 tiles ≈ 720 MB at typical world heights — large enough to cover the entire
+     * visible area at max zoom-out (1/8) without thrashing, while still bounding RAM for
+     * really-large maps where the full tile set is many thousands of tiles. Tiles outside
+     * this window re-render when the user pans back to them; the LRU on access order
+     * (see renderedTiles) keeps the currently-visible viewport safe from eviction.
+     */
+    private static final int BOUNDED_CACHE_TILES = 2000;
+
+    private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(ThreeDeeView.class);
     private static final long serialVersionUID = 2011101701L;
 
     public enum RefreshMode { IMMEDIATE, DELAYED, MANUAL }

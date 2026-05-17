@@ -487,10 +487,15 @@ public class WorldIO {
         // Lazy region paging — opt-in via Configuration. Only viable on B1+ archives (require
         // tile-index.bin and layers.bin); if either is missing for any dim, fall through to
         // eager. The lazy path keeps the ZipFile open; the eager path closes it before return.
-        if (Configuration.getInstance().isRegionPagingEnabled() && canLoadLazily(file)) {
+        final boolean regionPagingEnabled = Configuration.getInstance().isRegionPagingEnabled();
+        final boolean canLazy = canLoadLazily(file);
+        if (regionPagingEnabled && canLazy) {
+            logger.info("loadCompartmentalised: lazy path chosen for {}", file.getName());
             loadCompartmentalisedLazy(file);
             return;
         }
+        logger.info("loadCompartmentalised: eager path for {} (regionPagingEnabled={}, canLoadLazily={})",
+                file.getName(), regionPagingEnabled, canLazy);
         loadCompartmentalisedEager(file);
     }
 

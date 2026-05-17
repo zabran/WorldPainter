@@ -272,6 +272,27 @@ public class LazyTilePager implements TilePager {
         // World2.closeLazyResources (added in B2).
     }
 
+    /**
+     * Public budget-enforcement entry point. The 3D view's open path force-loads every tile
+     * (twice: once to build zSortedTiles, once to attach listeners), bypassing the budget for
+     * the duration of the session. When the view closes and releases its strong references,
+     * the resident map still holds every region — there's nothing to push past the budget so
+     * the load-time eviction never fires. Call this from the close path so the budget is
+     * re-enforced and tiles outside the dirty set become eligible for GC.
+     */
+    @Override
+    public void trimResidentToBudget(Map<Point, Tile> resident) {
+        synchronized (this) {
+            final int residentBefore = resident.size();
+            final int regionsBefore = loadedRegions.size();
+            evictUntilAtBudget(resident);
+            if (logger.isInfoEnabled()) {
+                logger.info("LazyTilePager.trimResidentToBudget: regions {} -> {}, resident tiles {} -> {} (budget={})",
+                        regionsBefore, loadedRegions.size(), residentBefore, resident.size(), residentRegionBudget);
+            }
+        }
+    }
+
     // --- Diagnostics for the smoke test / benchmark ---
 
     public long getTotalLoadNanos() {
