@@ -14,6 +14,7 @@ import org.pepsoft.worldpainter.App;
 import org.pepsoft.worldpainter.ColourScheme;
 import org.pepsoft.worldpainter.Dimension;
 import org.pepsoft.worldpainter.Tile;
+import org.pepsoft.worldpainter.TileRenderer;
 import org.pepsoft.worldpainter.biomeschemes.CustomBiomeManager;
 import org.pepsoft.worldpainter.layers.Layer;
 import org.pepsoft.worldpainter.threedeeview.Tile3DRenderer.LayerVisibilityMode;
@@ -118,6 +119,40 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
             }
         });
 
+        // D1: light-direction dropdown. The arrow in each item shows the direction the light
+        // TRAVELS (so the source is at the *opposite* corner): ↘ = light from NW going SE,
+        // ↓ = light from above going straight down, etc. On selection change we rebuild the
+        // ThreeDeeView so the embedded 2D TileRenderer picks up the new world-space LightOrigin
+        // and every tile re-renders. Combobox replaces the original cycle button because the
+        // rebuild takes a noticeable time on zoomed-out views and a click-to-cycle UI made it
+        // too easy to over-shoot the desired value with double-clicks.
+        lightCombo.setMaximumRowCount(LIGHT_ORIGIN_VALUES.length);
+        lightCombo.setRenderer(new javax.swing.DefaultListCellRenderer() {
+            private static final long serialVersionUID = 1L;
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                return super.getListCellRendererComponent(list, (value instanceof TileRenderer.LightOrigin) ? lightOriginLabel((TileRenderer.LightOrigin) value) : value, index, isSelected, cellHasFocus);
+            }
+        });
+        lightCombo.setSelectedItem(screenLightOrigin);
+        // Don't let the combobox stretch vertically in the JToolBar — it would balloon to
+        // toolbar height. Lock width too so it doesn't change as the user picks values with
+        // different label widths.
+        final java.awt.Dimension lightComboSize = lightCombo.getPreferredSize();
+        lightCombo.setMaximumSize(lightComboSize);
+        lightCombo.setMinimumSize(lightComboSize);
+        lightCombo.setToolTipText("<html>Pick which edge of the screen the light comes from. The arrow shows the direction the light travels:<br>" +
+                "↓ From top = sun above the top edge, rays travel downward on screen<br>" +
+                "← From right, ↑ From bottom, → From left — analogous<br>" +
+                "Above = overhead, no slope shading<br>" +
+                "The choice is locked to the screen, so rotating the view doesn't move the bright slopes.</html>");
+        lightCombo.addActionListener(e -> {
+            final TileRenderer.LightOrigin selected = (TileRenderer.LightOrigin) lightCombo.getSelectedItem();
+            if ((selected != null) && (selected != screenLightOrigin)) {
+                applyLightDirection(selected);
+            }
+        });
+
         JToolBar toolBar = new JToolBar();
         toolBar.setFloatable(false);
         toolBar.add(alwaysOnTopButton);
@@ -145,7 +180,13 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
         layerVisibilityButtonGroup.add(radioButtonLayersAll);
         toolBar.add(radioButtonLayersAll);
         // C1: push the cache checkbox to the right end of the toolbar with a separator before it.
+        // D1: the light combobox sits with the cache checkbox on the right side, preceded by a
+        // small "Light:" label so it's clear what's being picked. Separator between the two
+        // right-side widgets to visually group them.
         toolBar.add(Box.createHorizontalGlue());
+        toolBar.addSeparator();
+        toolBar.add(new JLabel("Light:"));
+        toolBar.add(lightCombo);
         toolBar.addSeparator();
         toolBar.add(cacheCheckBox);
         getContentPane().add(toolBar, BorderLayout.NORTH);
@@ -190,7 +231,7 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
             threeDeeView.disposeResources();
         }
         if (dimension != null) {
-            threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom);
+            threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom, screenLightOrigin);
             threeDeeView.setLayerVisibility(layerVisibility);
             threeDeeView.setHiddenLayers(hiddenLayers);
             threeDeeView.setCachingEnabled(cachingEnabled);
@@ -250,6 +291,58 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
         }
     }
 
+    /**
+     * D1: change the screen-relative light direction. The first iteration of D1 rebuilt the
+     * whole {@link ThreeDeeView} on every pick — that ran the open-time path (force-loads
+     * every tile, rebuilds zSortedTiles, ~1.3 GB of allocation per pick) which piled up
+     * faster than G1 could collect when the user cycled through values. Now we hot-swap the
+     * light direction into the existing view via {@link ThreeDeeView#setScreenLightOrigin},
+     * which propagates the new {@code LightOrigin} to every running renderer and triggers
+     * a refresh that only re-allocates BufferedImages for tiles in the visible viewport.
+     */
+    private void applyLightDirection(TileRenderer.LightOrigin newDirection) {
+        if (newDirection == null || newDirection == screenLightOrigin) {
+            return;
+        }
+        screenLightOrigin = newDirection;
+        lastScreenLightOrigin = newDirection;
+        if (threeDeeView != null) {
+            threeDeeView.setScreenLightOrigin(newDirection);
+        }
+    }
+
+    /**
+     * D1: label used in the light-direction combobox. Pure screen-space; rotation-invariant.
+     * The arrow shows the direction the light <em>travels</em> on the screen; the text names
+     * the screen edge the source is on.
+     * <p>
+     * Why screen-relative names instead of compass: in the iso projection each cardinal
+     * world direction (NW/NE/SE/SW) projects to a <em>screen cardinal</em> (top/right/bottom/
+     * left), not the diagonal of the same name. So naming the options NW/NE/SE/SW was
+     * misleading — they actually behave as top/right/bottom/left light. Plus the GlassPane's
+     * "N" arrow rotates with the view, so any world-compass label drifts visually as the
+     * user rotates. Cardinal screen labels (top/right/bottom/left) sidestep all of that.
+     * <p>
+     * Mapping (with the current screen→world rotation in worldLightFor):
+     * <ul>
+     *   <li>NORTHWEST → source at screen top, rays going down ({@code ↓ From top})</li>
+     *   <li>NORTHEAST → source at screen right, rays going left ({@code ← From right})</li>
+     *   <li>SOUTHEAST → source at screen bottom, rays going up ({@code ↑ From bottom})</li>
+     *   <li>SOUTHWEST → source at screen left, rays going right ({@code → From left})</li>
+     *   <li>ABOVE → overhead, no slope shading ({@code Above})</li>
+     * </ul>
+     */
+    private static String lightOriginLabel(TileRenderer.LightOrigin origin) {
+        switch (origin) {
+            case NORTHWEST: return "↓ From top";
+            case NORTHEAST: return "← From right";
+            case SOUTHEAST: return "↑ From bottom";
+            case SOUTHWEST: return "→ From left";
+            case ABOVE:     return "Above";
+            default: throw new InternalError();
+        }
+    }
+
     // WindowListener
 
     @Override
@@ -279,7 +372,7 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
             if (centreMostTile != null) {
                 // C1: release the OLD view's caches before swapping in the new one.
                 threeDeeView.disposeResources();
-                threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom);
+                threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom, screenLightOrigin);
                 threeDeeView.setLayerVisibility(layerVisibility);
                 threeDeeView.setHiddenLayers(hiddenLayers);
                 threeDeeView.setCachingEnabled(cachingEnabled);
@@ -308,7 +401,7 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
             if (centreMostTile != null) {
                 // C1: release the OLD view's caches before swapping in the new one.
                 threeDeeView.disposeResources();
-                threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom);
+                threeDeeView = new ThreeDeeView(dimension, colourScheme, customBiomeManager, rotation, zoom, screenLightOrigin);
                 threeDeeView.setLayerVisibility(layerVisibility);
                 threeDeeView.setHiddenLayers(hiddenLayers);
                 threeDeeView.setCachingEnabled(cachingEnabled);
@@ -553,6 +646,8 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
     final JToggleButton alwaysOnTopButton = new JToggleButton(ICON_ALWAYS_ON_TOP);
     /** C1: toolbar checkbox for the tile-cache optimisations on the active ThreeDeeView. */
     final JCheckBox cacheCheckBox = new JCheckBox("Cache tiles", lastCachingEnabled);
+    /** D1: toolbar combobox for the screen-relative light direction. */
+    final JComboBox<TileRenderer.LightOrigin> lightCombo = new JComboBox<>(LIGHT_ORIGIN_VALUES);
     private Dimension dimension;
     private ThreeDeeView threeDeeView;
     private ColourScheme colourScheme;
@@ -562,6 +657,8 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
     private Set<Layer> hiddenLayers;
     /** C1: master cache-on flag mirrored to every new ThreeDeeView created by this frame. */
     private boolean cachingEnabled = lastCachingEnabled;
+    /** D1: current screen-relative light direction, propagated into each new ThreeDeeView. */
+    private TileRenderer.LightOrigin screenLightOrigin = lastScreenLightOrigin;
 
     /**
      * C1: last value of {@link #cachingEnabled} from any ThreeDeeFrame this JVM has shown.
@@ -570,8 +667,20 @@ public class ThreeDeeFrame extends JFrame implements WindowListener {
      * not a saved one).
      */
     private static boolean lastCachingEnabled = true;
+
+    /**
+     * D1: last screen-relative light direction picked by the user in any ThreeDeeFrame this
+     * JVM has shown. New frames pick up this value so the choice persists across close +
+     * reopen. In-memory only; not written to Configuration. (The 2D view has its own light
+     * direction in {@code Configuration.defaultLightOrigin}; we deliberately keep the 3D
+     * pick separate because the 3D view's light is screen-relative whereas the 2D one is
+     * world-relative — semantically different.)
+     */
+    private static TileRenderer.LightOrigin lastScreenLightOrigin = TileRenderer.LightOrigin.NORTHWEST;
     
     private static final Direction[] DIRECTIONS = {Direction.EAST, Direction.SOUTH, Direction.WEST, Direction.NORTH};
+    /** D1: cached {@link TileRenderer.LightOrigin} values for the combobox model. */
+    private static final TileRenderer.LightOrigin[] LIGHT_ORIGIN_VALUES = TileRenderer.LightOrigin.values();
     
     private static final Icon ICON_ROTATE_LEFT    = IconUtils.loadScaledIcon("org/pepsoft/worldpainter/icons/arrow_rotate_anticlockwise.png");
     private static final Icon ICON_ROTATE_RIGHT   = IconUtils.loadScaledIcon("org/pepsoft/worldpainter/icons/arrow_rotate_clockwise.png");

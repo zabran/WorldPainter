@@ -8,6 +8,7 @@ import org.pepsoft.util.jobqueue.UniqueJobQueue;
 import org.pepsoft.worldpainter.ColourScheme;
 import org.pepsoft.worldpainter.Dimension;
 import org.pepsoft.worldpainter.Tile;
+import org.pepsoft.worldpainter.TileRenderer;
 import org.pepsoft.worldpainter.biomeschemes.CustomBiomeManager;
 import org.pepsoft.worldpainter.layers.Layer;
 import org.pepsoft.worldpainter.threedeeview.Tile3DRenderer.LayerVisibilityMode;
@@ -21,11 +22,11 @@ import java.util.Set;
  */
 public class Background3DTileRenderer extends Thread {
     public Background3DTileRenderer(Dimension dimension, ColourScheme colourScheme, CustomBiomeManager customBiomeManager, int rotation, UniqueJobQueue<Tile3DRenderJob> jobQueue, ThreeDeeRenderManager threeDeeRenderManager,
-                                    LayerVisibilityMode layerVisibility, Set<Layer> hiddenLayers) {
+                                    LayerVisibilityMode layerVisibility, Set<Layer> hiddenLayers, TileRenderer.LightOrigin screenLightOrigin) {
         super("Background 3D renderer");
         this.jobQueue = jobQueue;
         this.threeDeeRenderManager = threeDeeRenderManager;
-        renderer = new Tile3DRenderer(dimension, colourScheme, customBiomeManager, rotation, layerVisibility, hiddenLayers);
+        renderer = new Tile3DRenderer(dimension, colourScheme, customBiomeManager, rotation, layerVisibility, hiddenLayers, screenLightOrigin);
         setDaemon(true);
     }
 
@@ -55,6 +56,14 @@ public class Background3DTileRenderer extends Thread {
     public void halt() {
         running = false;
         interrupt();
+    }
+
+    /**
+     * D1: hot-swap the screen-relative light direction on the owned {@link Tile3DRenderer}.
+     * Safe to call from any thread; the actual update is a volatile write inside Tile3DRenderer.
+     */
+    public void setScreenLightOrigin(TileRenderer.LightOrigin newScreenLightOrigin) {
+        renderer.setScreenLightOrigin(newScreenLightOrigin);
     }
     
     /**

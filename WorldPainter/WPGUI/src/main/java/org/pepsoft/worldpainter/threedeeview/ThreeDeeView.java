@@ -37,11 +37,22 @@ import static org.pepsoft.worldpainter.threedeeview.Tile3DRenderer.LayerVisibili
  */
 public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile.Listener, HierarchyListener, ActionListener, Scrollable {
     public ThreeDeeView(Dimension dimension, ColourScheme colourScheme, CustomBiomeManager customBiomeManager, int rotation, int zoom) {
+        this(dimension, colourScheme, customBiomeManager, rotation, zoom, TileRenderer.LightOrigin.NORTHWEST);
+    }
+
+    /**
+     * D1: full constructor taking a <em>screen-relative</em> {@link TileRenderer.LightOrigin}.
+     * The view stores it to thread through to both the live render manager and the one-off
+     * Tile3DRenderer used by {@link #getImage} when exporting the view as a still image —
+     * so the export looks like what's on screen.
+     */
+    public ThreeDeeView(Dimension dimension, ColourScheme colourScheme, CustomBiomeManager customBiomeManager, int rotation, int zoom, TileRenderer.LightOrigin screenLightOrigin) {
         this.dimension = dimension;
         this.colourScheme = colourScheme;
         this.customBiomeManager = customBiomeManager;
         this.rotation = rotation;
         this.zoom = zoom;
+        this.screenLightOrigin = (screenLightOrigin != null) ? screenLightOrigin : TileRenderer.LightOrigin.NORTHWEST;
         scale = (int) Math.pow(2.0, Math.abs(zoom - 1));
 //        System.out.println("Zoom " + zoom + " -> scale " + scale);
         minHeight = dimension.getMinHeight();
@@ -63,7 +74,7 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
             tile.addListener(this);
             listenedTiles.add(tile);
         }
-        threeDeeRenderManager = new ThreeDeeRenderManager(dimension, colourScheme, customBiomeManager, rotation);
+        threeDeeRenderManager = new ThreeDeeRenderManager(dimension, colourScheme, customBiomeManager, rotation, this.screenLightOrigin);
 
         dimension.addDimensionListener(this);
 
@@ -128,7 +139,7 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     }
 
     public BufferedImage getImage(Rectangle imageBounds, ProgressReceiver progressReceiver) throws ProgressReceiver.OperationCancelled {
-        final Tile3DRenderer renderer = new Tile3DRenderer(dimension, colourScheme, customBiomeManager, rotation, layerVisibility, hiddenLayers);
+        final Tile3DRenderer renderer = new Tile3DRenderer(dimension, colourScheme, customBiomeManager, rotation, layerVisibility, hiddenLayers, screenLightOrigin);
 
         // Paint the complete image
         final int tileCount = zSortedTiles.values().stream().mapToInt(Map::size).sum();
@@ -314,6 +325,34 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
             renderedTiles.clear();
         }
         repaint();
+    }
+
+    /**
+     * D1: hot-swap the screen-relative light direction without rebuilding the whole view.
+     * Updates the render manager (which propagates to running threads via Tile3DRenderer's
+     * volatile field) and then triggers refresh so previously-rendered tiles re-render with
+     * the new direction. Much cheaper than the rebuild path used for rotation: avoids
+     * re-iterating {@code dimension.getTiles()} (which under B-mode force-loads every region),
+     * keeps the bounds cache, keeps listenedTiles, keeps zSortedTiles.
+     *
+     * Per-cycle allocation drops from ~1.3 GB (full rebuild including a fresh ThreeDeeView
+     * and 1824 BufferedImage renders) to roughly the size of the visible viewport's worth
+     * of fresh BufferedImages — ~30 to 200 tiles × 360 KB.
+     */
+    public void setScreenLightOrigin(TileRenderer.LightOrigin newScreenLightOrigin) {
+        if (newScreenLightOrigin == null || newScreenLightOrigin == this.screenLightOrigin) {
+            return;
+        }
+        this.screenLightOrigin = newScreenLightOrigin;
+        threeDeeRenderManager.setScreenLightOrigin(newScreenLightOrigin);
+        // Re-render everything currently cached. refresh(false) moves the existing renders
+        // to dirtyTiles so the user sees the (stale-lit) old tiles during the re-render
+        // instead of empty space — same UX as a 2D light-direction rotate.
+        refresh(false);
+    }
+
+    public TileRenderer.LightOrigin getScreenLightOrigin() {
+        return screenLightOrigin;
     }
     
     // Dimension.Listener
@@ -862,6 +901,14 @@ public class ThreeDeeView extends JComponent implements Dimension.Listener, Tile
     private final int minHeight, maxHeight;
     private final int xOffset, yOffset, maxX, maxY;
     private final int rotation;
+    /**
+     * D1: the screen-relative light direction. Threaded to the render manager (for live
+     * rendering) and to one-off {@link Tile3DRenderer} instances created by {@link #getImage}
+     * (so the exported image matches what's on screen). Mutable at runtime via
+     * {@link #setScreenLightOrigin}, which hot-swaps the value into the running renderers
+     * without rebuilding the view.
+     */
+    private TileRenderer.LightOrigin screenLightOrigin;
     private final SortedMap<Integer, SortedMap<Integer, Tile>> zSortedTiles;
     private final CustomBiomeManager customBiomeManager;
     private final boolean upsideDown;

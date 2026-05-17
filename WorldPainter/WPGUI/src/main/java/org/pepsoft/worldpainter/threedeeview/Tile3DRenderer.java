@@ -35,11 +35,37 @@ import static org.pepsoft.worldpainter.threedeeview.ThreeDeeView.TILE_NOT_RENDER
 // TODO: adapt for new dynamic maximum level height
 public class Tile3DRenderer {
     public Tile3DRenderer(Dimension dimension, ColourScheme colourScheme, CustomBiomeManager customBiomeManager, int rotation, LayerVisibilityMode layerVisibility, Set<Layer> hiddenLayers) {
+        this(dimension, colourScheme, customBiomeManager, rotation, layerVisibility, hiddenLayers, TileRenderer.LightOrigin.NORTHWEST);
+    }
+
+    /**
+     * D1: full constructor including the <strong>screen-relative</strong> {@code LightOrigin}.
+     * The 3D iso view picks one of the four cardinal-diagonal directions on screen (or ABOVE);
+     * we map it to the corresponding world-space LightOrigin given the current view rotation,
+     * so that the bright/dark slopes stay locked to the chosen screen direction as the user
+     * spins the view. See {@link #worldLightFor(TileRenderer.LightOrigin, int)} for the math.
+     */
+    public Tile3DRenderer(Dimension dimension, ColourScheme colourScheme, CustomBiomeManager customBiomeManager, int rotation, LayerVisibilityMode layerVisibility, Set<Layer> hiddenLayers, TileRenderer.LightOrigin screenLightOrigin) {
         this.dimension = dimension;
         minHeight = dimension.getMinHeight();
         this.colourScheme = colourScheme;
         this.rotation = rotation;
+        this.screenLightOrigin = (screenLightOrigin != null) ? screenLightOrigin : TileRenderer.LightOrigin.NORTHWEST;
         tileRenderer = new TileRenderer(dimension, colourScheme, customBiomeManager, 0, true, null);
+        // D1: configure the embedded 2D renderer's light direction. The 2D renderer applies
+        // its directional shading to the top row of pixels we sample for each terrain column
+        // (via tileImgBuffer.getRGB below). Without this call, the embedded TileRenderer keeps
+        // its default NORTHWEST and the top-row shading stays in world-space regardless of
+        // 3D-view rotation — i.e. the shadows look right at rotation 0 but slide to a different
+        // screen direction at every other rotation. With the screen→world mapping below, the
+        // shadows stay locked to the chosen screen direction at all rotations.
+        //
+        // {@link #render} re-applies this on every render so a runtime call to
+        // {@link #setScreenLightOrigin} from the EDT takes effect on the next rendered tile
+        // without recreating the renderer. The embedded TileRenderer is documented as
+        // single-thread per instance and we own it on the render thread, so the per-render
+        // {@code setLightOrigin} call is safe and cheap (just a field assignment).
+        tileRenderer.setLightOrigin(worldLightFor(this.screenLightOrigin, rotation));
         switch (layerVisibility) {
             case NONE:
                 tileRenderer.setHideAllLayers(true);
@@ -82,9 +108,23 @@ public class Tile3DRenderer {
         platform = tileRenderer.getPlatform();
     }
     
+    /**
+     * D1: hot-swap the screen-relative light direction. Safe to call from any thread; the
+     * volatile write ensures visibility on the render thread that owns this Tile3DRenderer.
+     * Effect lands on the next {@link #render} call.
+     */
+    public void setScreenLightOrigin(TileRenderer.LightOrigin newScreenLightOrigin) {
+        if (newScreenLightOrigin != null) {
+            this.screenLightOrigin = newScreenLightOrigin;
+        }
+    }
+
     @SuppressWarnings("SuspiciousNameCombination") // Don't worry about it, we're rotating the tile
     public BufferedImage render(Tile tile) {
 //        System.out.println("Rendering tile " + tile);
+        // D1: re-apply the (possibly updated) screen-relative light direction. Cheap field
+        // assignment; ensures any setScreenLightOrigin() from the EDT has taken effect.
+        tileRenderer.setLightOrigin(worldLightFor(screenLightOrigin, rotation));
         tileRenderer.renderTile(tile, tileImgBuffer, 0, 0);
 //        Terrain subSurfaceMaterial = dimension.getSubsurfaceMaterial();
         final long seed = dimension.getSeed();
@@ -268,6 +308,12 @@ public class Tile3DRenderer {
     private final int minHeight, rotation, stoneColour, waterColour, lavaColour, iceColour;
     private final Platform platform;
     private final boolean hideFrost, hideFluids;
+    /**
+     * D1: current screen-relative light direction. {@code volatile} because {@link #setScreenLightOrigin}
+     * is called from the EDT while {@link #render} reads it on the render thread that owns
+     * this Tile3DRenderer. Enum reference reads/writes are atomic; volatile gives happens-before.
+     */
+    private volatile TileRenderer.LightOrigin screenLightOrigin;
 
     private final BufferedImage tileImgBuffer = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_RGB);
 
@@ -281,4 +327,50 @@ public class Tile3DRenderer {
     private static final Logger logger = LoggerFactory.getLogger(Tile3DRenderer.class);
 
     public enum LayerVisibilityMode { NONE, SYNC, SURFACE }
+
+    /**
+     * D1: map a <em>screen-relative</em> {@link TileRenderer.LightOrigin} (the direction the
+     * user picked, expressed as one of NW/NE/SE/SW/ABOVE on the screen) to the world-space
+     * LightOrigin to feed the embedded 2D {@link TileRenderer}, given the current 3D-view
+     * rotation.
+     * <p>
+     * Derivation: the iso projection used by this renderer (imgX = TILE_SIZE + x - y, imgY =
+     * (x + y) / 2 + ...) places, at rotation 0, world-NW at the top of the screen, world-NE
+     * on the right, world-SE at the bottom and world-SW on the left. Each rotation step
+     * (the {@code rotation} parameter, 0..3) remaps {@code (xInTile, yInTile)} so that the
+     * world appears rotated 90° clockwise on the screen (camera circles 90° anticlockwise
+     * around the world). A light source attached to the world would therefore visually
+     * rotate CW on screen too — so to keep it at a <em>fixed</em> screen direction, the
+     * world-space LightOrigin must rotate 90° <em>counter</em>-clockwise per rotation step
+     * (opposite the world's apparent CW screen rotation, cancelling it).
+     * <p>
+     * The {@code LightOrigin} enum's ordinals are CW (NW=0, NE=1, SE=2, SW=3), so CCW
+     * movement is a modular subtract. {@code ABOVE} is rotation-invariant.
+     * <p>
+     * Sanity-check: at each rotation, which world direction lands at screen-top (pixel
+     * direction {@code (0, -1)} under the iso formula)? Solving gives rotation 0→NW, 1→SW,
+     * 2→SE, 3→NE — and exactly this {@code ordinal - rotation} table.
+     *
+     * @param screen   The screen-relative light direction the user picked.
+     * @param rotation The current 3D-view rotation (0..3).
+     * @return The world-space {@code LightOrigin} for the embedded 2D renderer.
+     */
+    static TileRenderer.LightOrigin worldLightFor(TileRenderer.LightOrigin screen, int rotation) {
+        if (screen == null) {
+            return TileRenderer.LightOrigin.NORTHWEST;
+        }
+        if (screen == TileRenderer.LightOrigin.ABOVE) {
+            return screen;
+        }
+        final TileRenderer.LightOrigin[] cw = {
+                TileRenderer.LightOrigin.NORTHWEST,
+                TileRenderer.LightOrigin.NORTHEAST,
+                TileRenderer.LightOrigin.SOUTHEAST,
+                TileRenderer.LightOrigin.SOUTHWEST
+        };
+        // CCW step per rotation: subtract. Java's `& 3` on negative ints wraps via
+        // two's complement (-1 & 3 == 3, -2 & 3 == 2, -3 & 3 == 1), giving the desired
+        // modular subtraction without an explicit `+ 4`.
+        return cw[(screen.ordinal() - rotation) & 3];
+    }
 }
