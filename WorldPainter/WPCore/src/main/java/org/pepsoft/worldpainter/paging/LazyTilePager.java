@@ -13,15 +13,16 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -31,12 +32,18 @@ import java.util.zip.ZipFile;
  * but holds tile bodies in compressed form inside the source {@link ZipFile} and decompresses
  * them on demand, a whole 4×4 region at a time.
  *
- * <p><b>B2 limitations:</b>
+ * <p><b>Eviction (B3a)</b>: each load past {@code residentRegionBudget} evicts the
+ * least-recently-loaded resident region whose tiles are not in
+ * {@code dimension.getDirtyRegions()} (dirty regions are pinned — evicting them would lose
+ * unsaved edits). Eviction is skipped during {@link #eagerLoadAll} so callers iterating all
+ * tiles see the complete set; peak RAM may exceed the budget during such iterations.
+ *
+ * <p><b>Remaining limitations:</b>
  * <ul>
- *   <li>No eviction. Every loaded region stays resident. LRU lands in B3.</li>
+ *   <li>Eviction is approximate-LRU: order tracks load events, not subsequent accesses.</li>
  *   <li>The source {@link ZipFile} stays open for the lifetime of the pager. Closing the
  *       world while WP is running will leak the file handle until GC; saving over the source
- *       file may fail on Windows. Both issues addressed in B4 (save-path integration).</li>
+ *       file may fail on Windows. Addressed in B4 (save-path integration).</li>
  * </ul>
  *
  * <p>Threading: {@link #loadTileFor} synchronises on {@code this} so concurrent first-access
@@ -55,22 +62,46 @@ public class LazyTilePager implements TilePager {
     private final LayerRegistry layerRegistry;
     private Consumer<Tile> tileLoadedCallback;
 
-    /** Regions already deserialised into resident; do NOT re-load them. */
-    private final Set<Point> loadedRegions = Collections.synchronizedSet(new HashSet<>());
+    /**
+     * Regions already deserialised into resident, in approximate-LRU order (oldest load first).
+     * Guarded by {@code this}; iteration must not happen outside the synchronized block.
+     */
+    private final LinkedHashSet<Point> loadedRegions = new LinkedHashSet<>();
+
+    /** Max resident regions; 0 or negative = unlimited. */
+    private final int residentRegionBudget;
+
+    /** Supplies the set of dirty regions to pin from eviction. Null = nothing pinned. */
+    private Supplier<Set<Point>> dirtyRegionsSupplier;
+
+    /** Reentry guard: skip eviction during eagerLoadAll. */
+    private boolean eagerLoadInProgress;
 
     private final AtomicLong totalLoadNanos = new AtomicLong();
     private final AtomicLong totalLoadCount = new AtomicLong();
+    private final AtomicLong totalEvictionCount = new AtomicLong();
 
     public LazyTilePager(ZipFile zipFile,
                           String dimPrefix,
                           Set<Point> knownTileCoords,
                           Map<Point, ZipEntry> regionEntriesByRegionCoord,
-                          LayerRegistry layerRegistry) {
+                          LayerRegistry layerRegistry,
+                          int residentRegionBudget) {
         this.zipFile = Objects.requireNonNull(zipFile, "zipFile");
         this.dimPrefix = Objects.requireNonNull(dimPrefix, "dimPrefix");
         this.knownTileCoords = Objects.requireNonNull(knownTileCoords, "knownTileCoords");
         this.regionEntriesByRegionCoord = Objects.requireNonNull(regionEntriesByRegionCoord, "regionEntriesByRegionCoord");
         this.layerRegistry = Objects.requireNonNull(layerRegistry, "layerRegistry");
+        this.residentRegionBudget = residentRegionBudget;
+    }
+
+    /**
+     * Supply the set of "dirty" (modified-since-load) regions to pin from eviction. Called by
+     * {@link org.pepsoft.worldpainter.Dimension#attachTilePagerForLoad} so the pager can call
+     * {@code dimension.getDirtyRegions()} on each eviction sweep.
+     */
+    public void setDirtyRegionsSupplier(Supplier<Set<Point>> supplier) {
+        this.dirtyRegionsSupplier = supplier;
     }
 
     /**
@@ -126,6 +157,10 @@ public class LazyTilePager implements TilePager {
             loadedRegions.add(regionCoord);
             totalLoadNanos.addAndGet(System.nanoTime() - t0);
             totalLoadCount.incrementAndGet();
+            // Evict unless we're in the middle of eagerLoadAll (which wants every region).
+            if (!eagerLoadInProgress) {
+                evictUntilAtBudget(resident);
+            }
             return resident.get(tileCoord);
         }
     }
@@ -133,21 +168,57 @@ public class LazyTilePager implements TilePager {
     @Override
     public void eagerLoadAll(Map<Point, Tile> resident) {
         synchronized (this) {
-            for (Map.Entry<Point, ZipEntry> e : regionEntriesByRegionCoord.entrySet()) {
-                if (loadedRegions.contains(e.getKey())) {
-                    continue;
+            eagerLoadInProgress = true;
+            try {
+                for (Map.Entry<Point, ZipEntry> e : regionEntriesByRegionCoord.entrySet()) {
+                    if (loadedRegions.contains(e.getKey())) {
+                        continue;
+                    }
+                    final long t0 = System.nanoTime();
+                    try {
+                        loadRegionEntry(e.getValue(), resident);
+                    } catch (IOException ex) {
+                        throw new UncheckedIOException(
+                                "Eager-load failed for region " + e.getKey() + " in " + dimPrefix, ex);
+                    }
+                    loadedRegions.add(e.getKey());
+                    totalLoadNanos.addAndGet(System.nanoTime() - t0);
+                    totalLoadCount.incrementAndGet();
                 }
-                final long t0 = System.nanoTime();
-                try {
-                    loadRegionEntry(e.getValue(), resident);
-                } catch (IOException ex) {
-                    throw new UncheckedIOException(
-                            "Eager-load failed for region " + e.getKey() + " in " + dimPrefix, ex);
-                }
-                loadedRegions.add(e.getKey());
-                totalLoadNanos.addAndGet(System.nanoTime() - t0);
-                totalLoadCount.incrementAndGet();
+            } finally {
+                eagerLoadInProgress = false;
             }
+        }
+    }
+
+    /**
+     * Drop resident regions from the LRU tail until {@code loadedRegions.size() <= budget}.
+     * Skips regions in the dimension's dirty set (saving them via the lazy path would lose
+     * unsaved edits). Must be called under {@code synchronized(this)}.
+     */
+    private void evictUntilAtBudget(Map<Point, Tile> resident) {
+        if (residentRegionBudget <= 0 || loadedRegions.size() <= residentRegionBudget) {
+            return;
+        }
+        final Set<Point> pinned = (dirtyRegionsSupplier != null)
+                ? dirtyRegionsSupplier.get()
+                : Collections.emptySet();
+        final Iterator<Point> it = loadedRegions.iterator();
+        while (it.hasNext() && loadedRegions.size() > residentRegionBudget) {
+            final Point region = it.next();
+            if (pinned.contains(region)) {
+                continue;
+            }
+            // Drop every tile in this 4×4 region from resident. The Dimension's listener
+            // relationship is FROM tile TO listener, so simply releasing the strong reference
+            // here lets the tile's resident-side strong refs drop. GC handles the rest.
+            for (int dx = 0; dx < 4; dx++) {
+                for (int dy = 0; dy < 4; dy++) {
+                    resident.remove(new Point((region.x << 2) | dx, (region.y << 2) | dy));
+                }
+            }
+            it.remove();
+            totalEvictionCount.incrementAndGet();
         }
     }
 
@@ -164,7 +235,9 @@ public class LazyTilePager implements TilePager {
     @Override
     public void clearIndex() {
         knownTileCoords.clear();
-        loadedRegions.clear();
+        synchronized (this) {
+            loadedRegions.clear();
+        }
     }
 
     @Override
@@ -185,7 +258,17 @@ public class LazyTilePager implements TilePager {
     }
 
     public int getLoadedRegionCount() {
-        return loadedRegions.size();
+        synchronized (this) {
+            return loadedRegions.size();
+        }
+    }
+
+    public long getTotalEvictionCount() {
+        return totalEvictionCount.get();
+    }
+
+    public int getResidentRegionBudget() {
+        return residentRegionBudget;
     }
 
     /** Holder array trick to ferry the deserialised list out of the {@code IOAction} lambda. */

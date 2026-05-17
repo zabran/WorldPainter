@@ -586,6 +586,20 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
         this.regionPagingEnabled = enabled;
     }
 
+    /**
+     * Maximum number of 4×4 tile regions kept resident in memory when lazy paging is on.
+     * 0 or negative = no cap (regions accumulate until explicit eviction). A region is
+     * 16 tiles in WP nomenclature; rough size ~3-15 MB resident per region depending on
+     * tile content. Default 256 (≈ 1-4 GB peak in steady state).
+     */
+    public synchronized int getResidentRegionBudget() {
+        return residentRegionBudget;
+    }
+
+    public synchronized void setResidentRegionBudget(int budget) {
+        this.residentRegionBudget = budget;
+    }
+
     public synchronized LookAndFeel getLookAndFeel() {
         return lookAndFeel;
     }
@@ -1430,6 +1444,8 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
     private Map<String, byte[]> dockingFramesLayoutData;
     // Goal B: opt-in lazy region paging. See isRegionPagingEnabled() for rationale.
     private boolean regionPagingEnabled;
+    /** Max regions kept resident in lazy mode; 0 or negative = unlimited. See getter for sizing. */
+    private int residentRegionBudget = 256;
     private LookAndFeel lookAndFeel;
     private OverlayType overlayType = OverlayType.OPTIMISE_ON_LOAD;
     private int showCalloutCount = 3;

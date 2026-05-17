@@ -731,9 +731,10 @@ public class WorldIO {
             // 4. Build the pager and attach it. The pager's coord index uses a mutable wrapper
             //    around the loaded set so addTile/removeTile can update it cheaply.
             final Set<Point> mutableCoords = new HashSet<>(tileCoords);
+            final int budget = Configuration.getInstance().getResidentRegionBudget();
             final org.pepsoft.worldpainter.paging.LazyTilePager pager =
                     new org.pepsoft.worldpainter.paging.LazyTilePager(
-                            zip, prefix + "/", mutableCoords, regionEntries, registry);
+                            zip, prefix + "/", mutableCoords, regionEntries, registry, budget);
 
             dim.attachWorldFromLoad(world);
             world.attachDimensionFromLoad(dim);

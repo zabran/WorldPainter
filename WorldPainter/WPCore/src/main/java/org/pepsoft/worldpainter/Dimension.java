@@ -2359,6 +2359,8 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             throw new IllegalStateException("Dimension.tiles is not a PagingTileMap; cannot attach pager");
         }
         pager.setTileLoadedCallback(this::wireLoadedTile);
+        // Pin dirty regions from eviction — saving them via splice would lose unsaved edits.
+        pager.setDirtyRegionsSupplier(this::getDirtyRegions);
         ((PagingTileMap) tiles).setPager(pager);
     }
 

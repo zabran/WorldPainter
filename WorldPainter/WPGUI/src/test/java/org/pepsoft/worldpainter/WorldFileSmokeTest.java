@@ -354,7 +354,10 @@ public class WorldFileSmokeTest extends AbstractTool {
             throws IOException, UnloadableWorldException {
         final Configuration cfg = Configuration.getInstance();
         final boolean priorFlag = cfg.isRegionPagingEnabled();
+        final int priorBudget = cfg.getResidentRegionBudget();
         cfg.setRegionPagingEnabled(true);
+        // Default budget is enough for Arag's 127-region world, so eviction won't fire on the
+        // first round. We exercise that path explicitly with a tighter budget below.
         try {
             final long lazyLoadStart = System.currentTimeMillis();
             final WorldIO lazyIo = new WorldIO();
@@ -429,6 +432,48 @@ public class WorldFileSmokeTest extends AbstractTool {
             // Close to release the file handle.
             lazyWorld.closeLazyResources();
             logger.info("Lazy round-trip: PASSED");
+
+            // -------- 8b. B3a — LRU eviction under a tight budget --------
+            cfg.setResidentRegionBudget(10); // ~10 regions out of 127 = aggressive eviction
+            try {
+                final WorldIO tightIo = new WorldIO();
+                tightIo.load(zipOut);
+                final World2 tightWorld = tightIo.getWorld();
+                final Dimension tightDim = tightWorld.getDimensions().iterator().next();
+                final org.pepsoft.worldpainter.paging.LazyTilePager tightPager = tightDim.getTilePager();
+                if (tightPager.getResidentRegionBudget() != 10) {
+                    logger.error("B3a FAILED: pager budget {} != 10", tightPager.getResidentRegionBudget());
+                    System.exit(11);
+                }
+
+                // Touch every tile coord. With budget=10, the pager should evict aggressively.
+                int touched = 0;
+                for (Point coord : new HashSet<>(tightDim.getTileCoords())) {
+                    final Tile t = tightDim.getTile(coord);
+                    if (t == null) {
+                        logger.error("B3a FAILED: getTile({}) returned null", coord);
+                        System.exit(11);
+                    }
+                    touched++;
+                }
+                final int loadedAfter = tightPager.getLoadedRegionCount();
+                final long evictions = tightPager.getTotalEvictionCount();
+                if (loadedAfter > 10) {
+                    logger.error("B3a FAILED: {} regions resident, expected <= 10", loadedAfter);
+                    System.exit(11);
+                }
+                if (evictions == 0) {
+                    logger.error("B3a FAILED: no evictions despite tight budget");
+                    System.exit(11);
+                }
+                logger.info("Tight-budget walk: touched {} tiles, {} regions resident at end, "
+                                + "{} evictions total, {} loads total",
+                        touched, loadedAfter, evictions, tightPager.getTotalLoadCount());
+                tightWorld.closeLazyResources();
+                logger.info("LRU eviction under budget=10: PASSED");
+            } finally {
+                cfg.setResidentRegionBudget(priorBudget);
+            }
         } finally {
             cfg.setRegionPagingEnabled(priorFlag);
         }
