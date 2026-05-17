@@ -603,6 +603,31 @@ public class World2 extends InstanceKeeper implements Serializable, Cloneable {
         dimensionsByAnchor.put(dimension.getAnchor(), dimension);
     }
 
+    /**
+     * Goal B: handle to the open source archive when this world was loaded with
+     * {@code Configuration.regionPagingEnabled = true}. {@code null} in eager mode.
+     */
+    public org.pepsoft.worldpainter.paging.LazyArchive getLazyArchive() {
+        return lazyArchive;
+    }
+
+    /** Set the lazy archive. Called by {@link WorldIO#loadCompartmentalised} in lazy mode. */
+    public void setLazyArchive(org.pepsoft.worldpainter.paging.LazyArchive archive) {
+        this.lazyArchive = archive;
+    }
+
+    /**
+     * Release the open ZIP source file handle if this world was loaded in lazy mode.
+     * Call before discarding the world (closing the editor, loading a new world) to avoid
+     * leaking file handles. Idempotent and no-op for eager-loaded worlds.
+     */
+    public synchronized void closeLazyResources() throws java.io.IOException {
+        if (lazyArchive != null && !lazyArchive.isClosed()) {
+            lazyArchive.close();
+        }
+        lazyArchive = null;
+    }
+
     public synchronized void save(ZipOutputStream out) throws IOException {
         // 1. world-data.bin — everything but the dimensions
         out.putNextEntry(new ZipEntry("world-data.bin"));
@@ -993,6 +1018,13 @@ public class World2 extends InstanceKeeper implements Serializable, Cloneable {
     private transient Set<Warning> warnings;
     private transient Map<String, Object> metadata;
     private transient long changeNo;
+    /**
+     * Goal B: when the world was loaded with {@code Configuration.regionPagingEnabled = true},
+     * this holds the resource handle for the source ZIP (kept open for the world's lifetime so
+     * {@link org.pepsoft.worldpainter.paging.LazyTilePager} can deserialise regions on demand).
+     * Null in eager mode. Cleared by {@link #closeLazyResources()}.
+     */
+    private transient org.pepsoft.worldpainter.paging.LazyArchive lazyArchive;
 
     @Deprecated
     public static final int BIOME_ALGORITHM_NONE                = -1;

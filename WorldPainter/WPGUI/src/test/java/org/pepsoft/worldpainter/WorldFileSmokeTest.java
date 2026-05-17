@@ -275,7 +275,10 @@ public class WorldFileSmokeTest extends AbstractTool {
         }
         logger.info("load(InputStream) ZIP spool: {} ms — PASSED", streamSpoolMs);
 
-        // -------- 5. PR #478 microbenchmark --------
+        // -------- 8. B2 — lazy region paging round-trip --------
+        verifyLazyLoad(zipOut, totalTiles);
+
+        // -------- 9. PR #478 microbenchmark --------
         runPr478Benchmark();
     }
 
@@ -340,6 +343,97 @@ public class WorldFileSmokeTest extends AbstractTool {
      * that two tiles referencing the same built-in {@code Layer} (by id) get the <em>same</em>
      * canonical instance — i.e., the canonical-instance count must match the unique-id count.
      */
+    /**
+     * Verify B2 lazy mode: toggle {@code Configuration.regionPagingEnabled = true}, load the
+     * compartmentalised file via {@code load(File)}, confirm the dim has a pager attached,
+     * verify cheap operations (coord enumeration) don't load any regions, then trigger an
+     * actual {@code getTile} call and confirm the region is materialised correctly.
+     * Finally close the lazy archive and confirm the file handle is released.
+     */
+    private static void verifyLazyLoad(File zipOut, int totalTiles)
+            throws IOException, UnloadableWorldException {
+        final Configuration cfg = Configuration.getInstance();
+        final boolean priorFlag = cfg.isRegionPagingEnabled();
+        cfg.setRegionPagingEnabled(true);
+        try {
+            final long lazyLoadStart = System.currentTimeMillis();
+            final WorldIO lazyIo = new WorldIO();
+            lazyIo.load(zipOut);
+            final long lazyLoadMs = System.currentTimeMillis() - lazyLoadStart;
+            final World2 lazyWorld = lazyIo.getWorld();
+
+            // Dim should have a pager attached.
+            int totalLazyCoords = 0;
+            for (Dimension dim : lazyWorld.getDimensions()) {
+                if (dim.getTilePager() == null) {
+                    logger.error("B2 FAILED: dim {} has no pager attached", dim.getAnchor());
+                    System.exit(10);
+                }
+                totalLazyCoords += dim.getTileCoords().size();
+            }
+            if (totalLazyCoords != totalTiles) {
+                logger.error("B2 FAILED: coord index has {} tiles, expected {}",
+                        totalLazyCoords, totalTiles);
+                System.exit(10);
+            }
+            logger.info("Lazy load: {} ms, {} coords indexed across {} dim(s)",
+                    lazyLoadMs, totalLazyCoords, lazyWorld.getDimensions().size());
+
+            // After load, no regions should be resident yet.
+            int totalLoadedBefore = 0;
+            for (Dimension dim : lazyWorld.getDimensions()) {
+                totalLoadedBefore += dim.getTilePager().getLoadedRegionCount();
+            }
+            if (totalLoadedBefore != 0) {
+                logger.error("B2 FAILED: {} regions loaded after open (expected 0)", totalLoadedBefore);
+                System.exit(10);
+            }
+
+            // Force-load a single tile.
+            final Dimension dim = lazyWorld.getDimensions().iterator().next();
+            final Point firstCoord = dim.getTileCoords().iterator().next();
+            final long t0 = System.nanoTime();
+            final Tile firstTile = dim.getTile(firstCoord);
+            final long getTileMs = (System.nanoTime() - t0) / 1_000_000;
+            if (firstTile == null) {
+                logger.error("B2 FAILED: getTile({}) returned null", firstCoord);
+                System.exit(10);
+            }
+            logger.info("First-access getTile({}): {} ms; region count loaded={} after",
+                    firstCoord, getTileMs, dim.getTilePager().getLoadedRegionCount());
+
+            // Trigger eager-load of EVERYTHING (via values()) and verify the count matches.
+            // This also exercises the eagerLoadAll path.
+            final long fullLoadStart = System.currentTimeMillis();
+            int seen = 0;
+            for (Tile t : dim.getTiles()) {
+                if (t == null) {
+                    logger.error("B2 FAILED: null tile from getTiles()");
+                    System.exit(10);
+                }
+                seen++;
+            }
+            final long fullLoadMs = System.currentTimeMillis() - fullLoadStart;
+            if (seen != totalTiles) {
+                logger.error("B2 FAILED: eager iteration saw {} tiles, expected {}", seen, totalTiles);
+                System.exit(10);
+            }
+            logger.info("eagerLoadAll: {} ms; {} regions resident; {} loads total avg {} ms",
+                    fullLoadMs,
+                    dim.getTilePager().getLoadedRegionCount(),
+                    dim.getTilePager().getTotalLoadCount(),
+                    dim.getTilePager().getTotalLoadCount() > 0
+                            ? dim.getTilePager().getTotalLoadNanos() / dim.getTilePager().getTotalLoadCount() / 1_000_000
+                            : 0);
+
+            // Close to release the file handle.
+            lazyWorld.closeLazyResources();
+            logger.info("Lazy round-trip: PASSED");
+        } finally {
+            cfg.setRegionPagingEnabled(priorFlag);
+        }
+    }
+
     /**
      * Verify the {@code <anchor>/tile-index.bin} entry exists for every dimension in a freshly
      * saved compartmentalised archive, and that its decoded {@code Set<Point>} matches the

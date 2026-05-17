@@ -10,6 +10,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The map that backs {@code Dimension.tiles}. Acts as a transparent {@link HashMap}{@code <Point,
@@ -44,8 +45,13 @@ public class PagingTileMap implements Map<Point, Tile>, Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** Tiles currently resident in memory. In eager mode this is the complete tile set. */
-    private final Map<Point, Tile> resident;
+    /**
+     * Tiles currently resident in memory. In eager mode this is the complete tile set, backed
+     * by {@link HashMap}. In lazy mode (after {@link #setPager}) we swap to a
+     * {@link ConcurrentHashMap} so that the pager can mutate it under Dimension.readLock
+     * (lazy load is a read that has a write side-effect — caching).
+     */
+    private Map<Point, Tile> resident;
 
     /** Lazy backing store, or {@code null} for eager mode. */
     private transient TilePager pager;
@@ -68,6 +74,9 @@ public class PagingTileMap implements Map<Point, Tile>, Serializable {
      * Attach a pager, switching this map into lazy mode. May only be called once and only on
      * an empty map (we don't yet support mixing a pre-populated resident set with a lazy
      * coord index; that's something to consider for future phases).
+     *
+     * <p>Side effect: swaps the resident map to {@link ConcurrentHashMap} so reads can mutate
+     * it concurrently with other reads — lazy loads are reads-with-caching-write semantics.
      */
     public void setPager(TilePager pager) {
         if (this.pager != null) {
@@ -76,7 +85,17 @@ public class PagingTileMap implements Map<Point, Tile>, Serializable {
         if (!resident.isEmpty()) {
             throw new IllegalStateException("Cannot switch a non-empty PagingTileMap into lazy mode");
         }
+        this.resident = new ConcurrentHashMap<>();
         this.pager = pager;
+    }
+
+    /**
+     * Live view of the resident map, for the pager to mutate. Intentionally returns the
+     * internal field so {@link TilePager#loadTileFor} can populate it as a side-effect of
+     * loading.
+     */
+    Map<Point, Tile> residentRef() {
+        return resident;
     }
 
     public TilePager getPager() {

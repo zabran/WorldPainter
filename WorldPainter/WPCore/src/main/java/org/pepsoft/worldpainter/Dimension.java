@@ -2322,6 +2322,16 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             throw new IllegalStateException("Tile already loaded at " + key);
         }
         tiles.put(key, tile);
+        wireLoadedTile(tile);
+    }
+
+    /**
+     * The "wireup" half of {@link #attachTileFromLoad} — attach Dimension as a {@link Tile.Listener}
+     * and bind the tile's garden seeds to this Dimension's garden. Factored out so the lazy load
+     * path can call it as a callback after a {@link org.pepsoft.worldpainter.paging.LazyTilePager}
+     * has put the tile into the resident map.
+     */
+    void wireLoadedTile(Tile tile) {
         tile.addListener(this);
         final Set<Seed> seeds = tile.getSeeds();
         if (seeds != null) {
@@ -2329,6 +2339,37 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
                 gardenSeed.garden = garden;
             }
         }
+    }
+
+    /**
+     * Goal B (lazy mode): replace the in-memory tile set with a coord index only, and attach
+     * the given pager so subsequent {@code getTile} calls load regions on demand. Must be
+     * called before any tile is read — the current {@code tiles} map must be empty.
+     *
+     * <p>The pager's tile-loaded callback is wired to {@link #wireLoadedTile} so the standard
+     * listener+garden-seed setup happens for every tile the pager materialises.
+     *
+     * @param pager   the lazy backing store, already constructed with the dim's ZIP entries
+     *                and tile coord index
+     * @param coords  the {@code Set<Point>} read from {@code <anchor>/tile-index.bin}; copied
+     *                into the pager's coord index
+     */
+    public void attachTilePagerForLoad(org.pepsoft.worldpainter.paging.LazyTilePager pager) {
+        if (! (tiles instanceof PagingTileMap)) {
+            throw new IllegalStateException("Dimension.tiles is not a PagingTileMap; cannot attach pager");
+        }
+        pager.setTileLoadedCallback(this::wireLoadedTile);
+        ((PagingTileMap) tiles).setPager(pager);
+    }
+
+    /** Returns the attached {@link org.pepsoft.worldpainter.paging.LazyTilePager}, or null in eager mode. */
+    public org.pepsoft.worldpainter.paging.LazyTilePager getTilePager() {
+        if (tiles instanceof PagingTileMap) {
+            final org.pepsoft.worldpainter.paging.TilePager p = ((PagingTileMap) tiles).getPager();
+            return (p instanceof org.pepsoft.worldpainter.paging.LazyTilePager)
+                    ? (org.pepsoft.worldpainter.paging.LazyTilePager) p : null;
+        }
+        return null;
     }
 
     public void save(ZipOutputStream out) throws IOException {

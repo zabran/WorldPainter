@@ -573,6 +573,19 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
         this.dockingFramesLayoutData = data;
     }
 
+    // Goal B: opt-in lazy region paging. When true, compartmentalised .world.zip files load
+    // tile coordinates only (cheap index from tile-index.bin); tile bodies are deserialised
+    // on demand from per-region ZIP entries. Off by default — small/medium maps don't benefit
+    // and pay per-region disk-read latency on first access of every panned-to region. Enable
+    // for huge (country-scale) maps via Preferences.
+    public synchronized boolean isRegionPagingEnabled() {
+        return regionPagingEnabled;
+    }
+
+    public synchronized void setRegionPagingEnabled(boolean enabled) {
+        this.regionPagingEnabled = enabled;
+    }
+
     public synchronized LookAndFeel getLookAndFeel() {
         return lookAndFeel;
     }
@@ -1415,6 +1428,8 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
     // so JIDE bytes saved by release WP coexist with our DockingFrames bytes).
     private byte[] defaultDockingFramesLayoutData;
     private Map<String, byte[]> dockingFramesLayoutData;
+    // Goal B: opt-in lazy region paging. See isRegionPagingEnabled() for rationale.
+    private boolean regionPagingEnabled;
     private LookAndFeel lookAndFeel;
     private OverlayType overlayType = OverlayType.OPTIMISE_ON_LOAD;
     private int showCalloutCount = 3;

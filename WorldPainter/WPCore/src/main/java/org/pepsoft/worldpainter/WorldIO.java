@@ -484,6 +484,284 @@ public class WorldIO {
      */
     @SuppressWarnings("unchecked")
     public void loadCompartmentalised(File file) throws IOException, UnloadableWorldException {
+        // Lazy region paging — opt-in via Configuration. Only viable on B1+ archives (require
+        // tile-index.bin and layers.bin); if either is missing for any dim, fall through to
+        // eager. The lazy path keeps the ZipFile open; the eager path closes it before return.
+        if (Configuration.getInstance().isRegionPagingEnabled() && canLoadLazily(file)) {
+            loadCompartmentalisedLazy(file);
+            return;
+        }
+        loadCompartmentalisedEager(file);
+    }
+
+    /**
+     * Cheap pre-check: does {@code file} contain {@code layers.bin} AND a {@code tile-index.bin}
+     * entry per dimension? If yes, lazy load is feasible.
+     */
+    private static boolean canLoadLazily(File file) {
+        try (ZipFile zf = new ZipFile(file)) {
+            if (zf.getEntry("layers.bin") == null) {
+                return false;
+            }
+            // Each dim must have BOTH dim-data.bin AND tile-index.bin.
+            final Set<String> dimPrefixesWithIndex = new HashSet<>();
+            final Set<String> dimPrefixesWithDimData = new HashSet<>();
+            final Enumeration<? extends ZipEntry> entries = zf.entries();
+            while (entries.hasMoreElements()) {
+                final ZipEntry e = entries.nextElement();
+                final String name = e.getName();
+                final int slash = name.indexOf('/');
+                if (slash <= 0) continue;
+                final String prefix = name.substring(0, slash);
+                final String rest = name.substring(slash + 1);
+                if ("dim-data.bin".equals(rest)) {
+                    dimPrefixesWithDimData.add(prefix);
+                } else if ("tile-index.bin".equals(rest)) {
+                    dimPrefixesWithIndex.add(prefix);
+                }
+            }
+            return !dimPrefixesWithDimData.isEmpty()
+                    && dimPrefixesWithIndex.containsAll(dimPrefixesWithDimData);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Goal B (B2) lazy load path. Reads {@code metadata.json}, {@code layers.bin},
+     * {@code world-data.bin}, and one {@code dim-data.bin} + {@code tile-index.bin} pair per
+     * dimension. Does NOT read any {@code region-data-X,Y.bin} entry — instead, hands each
+     * dim a {@link org.pepsoft.worldpainter.paging.LazyTilePager} that defers region reads
+     * to first access. Keeps the {@link ZipFile} open for the lifetime of the world; the
+     * caller must invoke {@link World2#closeLazyResources()} before discarding the world.
+     */
+    @SuppressWarnings("unchecked")
+    private void loadCompartmentalisedLazy(File file) throws IOException, UnloadableWorldException {
+        final Map<String, Object>[] metadataHolder = new Map[]{null};
+        world = null;
+        ZipFile zip = new ZipFile(file);
+        boolean handedOff = false;
+        try {
+            // 1. metadata.json
+            final ZipEntry metaEntry = zip.getEntry("metadata.json");
+            if (metaEntry != null) {
+                try (InputStream in = zip.getInputStream(metaEntry)) {
+                    metadataHolder[0] = new ObjectMapper().readValue(in, Map.class);
+                }
+            }
+
+            // 2. layers.bin → LayerRegistry. canLoadLazily verified this exists.
+            final org.pepsoft.worldpainter.io.LayerRegistry registry;
+            final ZipEntry layersEntry = zip.getEntry("layers.bin");
+            try (ObjectInputStream layersIn = new WPCustomObjectInputStream(
+                    zip.getInputStream(layersEntry),
+                    PluginManager.getPluginClassLoader(),
+                    AbstractObject.class)) {
+                final Object obj = layersIn.readObject();
+                if (! (obj instanceof org.pepsoft.worldpainter.io.LayerRegistry)) {
+                    throw new UnloadableWorldException(
+                            "layers.bin contains object of unexpected type " + obj.getClass(),
+                            metadataHolder[0]);
+                }
+                registry = (org.pepsoft.worldpainter.io.LayerRegistry) obj;
+            }
+
+            // 3. world-data.bin → World2 (under the registry binding so LayerRefs resolve)
+            final ZipEntry worldEntry = zip.getEntry("world-data.bin");
+            if (worldEntry == null) {
+                throw new UnloadableWorldException(
+                        "Compartmentalised archive missing world-data.bin entry",
+                        metadataHolder[0]);
+            }
+            final ZipFile zipFinal = zip;
+            final Map<String, Object> finalMetadata = metadataHolder[0];
+            try {
+                org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withLoadBinding(
+                        registry,
+                        () -> {
+                            try {
+                                readWorldDataLazy(zipFinal, worldEntry, finalMetadata);
+                                readPerDimLazy(zipFinal, registry, finalMetadata);
+                            } catch (UnloadableWorldException e) {
+                                throw new WrappedUnloadable(e);
+                            }
+                        });
+            } catch (WrappedUnloadable e) {
+                throw e.original;
+            }
+
+            // 4. Attach the LazyArchive to the world for later close coordination.
+            final org.pepsoft.worldpainter.paging.LazyArchive archive =
+                    new org.pepsoft.worldpainter.paging.LazyArchive(file, zip, registry);
+            // Register every pager we created so archive.close() cascades.
+            for (Dimension dim : world.getDimensions()) {
+                if (dim.getTilePager() != null) {
+                    archive.registerPager(dim.getTilePager());
+                }
+            }
+            world.setLazyArchive(archive);
+            handedOff = true;
+            if (metadataHolder[0] != null) {
+                world.setMetadata(metadataHolder[0]);
+            }
+            logger.info("Lazy load: kept {} open (deferred {} region entries; "
+                            + "{} tile coords across {} dim(s) loaded from tile-index)",
+                    file.getName(), archive.getZipFile().size(),
+                    totalCoordCount(world), world.getDimensions().size());
+        } catch (ZipException | StreamCorruptedException | IllegalArgumentException
+                 | ClassNotFoundException | InvalidClassException | EOFException e) {
+            throw new UnloadableWorldException(e.getClass().getSimpleName()
+                    + " while lazy-loading world", e, metadataHolder[0]);
+        } finally {
+            if (! handedOff) {
+                try {
+                    zip.close();
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            }
+        }
+    }
+
+    private static int totalCoordCount(World2 world) {
+        int n = 0;
+        for (Dimension dim : world.getDimensions()) {
+            n += dim.getTileCount();
+        }
+        return n;
+    }
+
+    /** world-data.bin reader for the lazy path. Sets {@code this.world}. */
+    private void readWorldDataLazy(ZipFile zip, ZipEntry worldEntry, Map<String, Object> metadata)
+            throws IOException, UnloadableWorldException, ClassNotFoundException {
+        try (WPCustomObjectInputStream wrappedIn = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectInputStream(
+                zip.getInputStream(worldEntry),
+                PluginManager.getPluginClassLoader(),
+                AbstractObject.class)) {
+            final Object obj = wrappedIn.readObject();
+            if (! (obj instanceof World2)) {
+                throw new UnloadableWorldException(
+                        "world-data.bin contains object of unexpected type " + obj.getClass(),
+                        metadata);
+            }
+            world = (World2) obj;
+        }
+    }
+
+    /**
+     * Per-dim reader for the lazy path. For each dimension prefix: read {@code dim-data.bin},
+     * read {@code tile-index.bin}, build the region-entry map (no reads of the region bodies),
+     * create the LazyTilePager and attach it to the Dimension.
+     */
+    private void readPerDimLazy(ZipFile zip, org.pepsoft.worldpainter.io.LayerRegistry registry,
+                                 Map<String, Object> metadata)
+            throws IOException, UnloadableWorldException, ClassNotFoundException {
+        // Group ZIP entries.
+        final Map<String, ZipEntry> dimEntryByPrefix = new HashMap<>();
+        final Map<String, ZipEntry> tileIndexByPrefix = new HashMap<>();
+        final Map<String, Map<Point, ZipEntry>> regionByPrefix = new HashMap<>();
+        final Enumeration<? extends ZipEntry> entries = zip.entries();
+        while (entries.hasMoreElements()) {
+            final ZipEntry e = entries.nextElement();
+            final String name = e.getName();
+            final int slash = name.indexOf('/');
+            if (slash <= 0) continue;
+            final String prefix = name.substring(0, slash);
+            final String rest = name.substring(slash + 1);
+            if ("dim-data.bin".equals(rest)) {
+                dimEntryByPrefix.put(prefix, e);
+            } else if ("tile-index.bin".equals(rest)) {
+                tileIndexByPrefix.put(prefix, e);
+            } else if (rest.startsWith("region-data-")) {
+                final Point regionCoord = parseRegionCoord(rest);
+                if (regionCoord != null) {
+                    regionByPrefix.computeIfAbsent(prefix, k -> new HashMap<>()).put(regionCoord, e);
+                }
+            }
+        }
+
+        for (Map.Entry<String, ZipEntry> dimEnt : dimEntryByPrefix.entrySet()) {
+            final String prefix = dimEnt.getKey();
+            // 1. dim-data.bin → Dimension
+            final Dimension dim;
+            try (WPCustomObjectInputStream wrappedIn = org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.newObjectInputStream(
+                    zip.getInputStream(dimEnt.getValue()),
+                    PluginManager.getPluginClassLoader(),
+                    AbstractObject.class)) {
+                final Object obj = wrappedIn.readObject();
+                if (! (obj instanceof Dimension)) {
+                    throw new UnloadableWorldException(
+                            prefix + "/dim-data.bin contains object of unexpected type " + obj.getClass(),
+                            metadata);
+                }
+                dim = (Dimension) obj;
+            }
+
+            // Defensive anchor cross-check.
+            final Dimension.Anchor expectedAnchor;
+            try {
+                expectedAnchor = Dimension.Anchor.fromString(prefix);
+            } catch (RuntimeException e) {
+                throw new UnloadableWorldException(
+                        "Cannot parse dimension anchor from entry path '" + prefix + "'",
+                        e, metadata);
+            }
+            if (! expectedAnchor.equals(dim.getAnchor())) {
+                throw new UnloadableWorldException(
+                        "Anchor mismatch in '" + prefix + "': dim-data.bin has " + dim.getAnchor()
+                                + " but path prefix implies " + expectedAnchor,
+                        metadata);
+            }
+
+            // 2. tile-index.bin → Set<Point>
+            final ZipEntry indexEntry = tileIndexByPrefix.get(prefix);
+            if (indexEntry == null) {
+                throw new UnloadableWorldException(
+                        prefix + "/tile-index.bin missing in lazy-load eligibility verified archive",
+                        metadata);
+            }
+            final Set<Point> tileCoords;
+            try (InputStream in = zip.getInputStream(indexEntry)) {
+                tileCoords = Dimension.readTileIndexPayload(in);
+            }
+
+            // 3. Per-region entry map (no reads of the bodies).
+            final Map<Point, ZipEntry> regionEntries = regionByPrefix.getOrDefault(prefix, new HashMap<>());
+
+            // 4. Build the pager and attach it. The pager's coord index uses a mutable wrapper
+            //    around the loaded set so addTile/removeTile can update it cheaply.
+            final Set<Point> mutableCoords = new HashSet<>(tileCoords);
+            final org.pepsoft.worldpainter.paging.LazyTilePager pager =
+                    new org.pepsoft.worldpainter.paging.LazyTilePager(
+                            zip, prefix + "/", mutableCoords, regionEntries, registry);
+
+            dim.attachWorldFromLoad(world);
+            world.attachDimensionFromLoad(dim);
+            dim.attachTilePagerForLoad(pager);
+        }
+    }
+
+    /** Parse a {@code region-data-X,Y.bin} entry name's region coords. Returns null on garbage. */
+    private static Point parseRegionCoord(String entryRest) {
+        // entryRest is "region-data-X,Y.bin"
+        if (! entryRest.startsWith("region-data-") || ! entryRest.endsWith(".bin")) {
+            return null;
+        }
+        final String coordPart = entryRest.substring("region-data-".length(),
+                entryRest.length() - ".bin".length());
+        final int comma = coordPart.indexOf(',');
+        if (comma < 0) return null;
+        try {
+            final int x = Integer.parseInt(coordPart.substring(0, comma));
+            final int y = Integer.parseInt(coordPart.substring(comma + 1));
+            return new Point(x, y);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void loadCompartmentalisedEager(File file) throws IOException, UnloadableWorldException {
         final Map<String, Object>[] metadataHolder = new Map[]{null};
         world = null;
         try (ZipFile zip = new ZipFile(file)) {
