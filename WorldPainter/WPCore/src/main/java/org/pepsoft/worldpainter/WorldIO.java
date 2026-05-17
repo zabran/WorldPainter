@@ -253,6 +253,8 @@ public class WorldIO {
                     org.pepsoft.worldpainter.io.CompartmentalisedSerialisation.withSaveBinding(registry, () -> {
                         writeFreshEntry(zaos, prefix + "dim-data.bin", dim::writeDimDataPayload);
                     });
+                    // tile-index.bin always fresh — B1: per-dim coord index for lazy paging.
+                    writeFreshEntry(zaos, prefix + "tile-index.bin", dim::writeTileIndexPayload);
                 });
                 for (Point r : dim.getCurrentRegions()) {
                     final String entryName = prefix + "region-data-" + r.x + "," + r.y + ".bin";

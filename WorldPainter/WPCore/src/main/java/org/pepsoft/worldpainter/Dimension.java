@@ -2338,6 +2338,9 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
             try {
                 // 1. dim-data.bin
                 writeDimDataEntry(out);
+                // 1b. tile-index.bin — B1: cheap per-dim Set<Point> of tile coords for
+                // lazy region paging. Always fresh; small (~8 bytes per tile).
+                writeTileIndexEntry(out);
                 // 2. all region-data entries (every currently-tiled region)
                 final Set<Point> currentRegions = collectCurrentRegions();
                 for (Point r : currentRegions) {
@@ -2433,6 +2436,85 @@ public class Dimension extends InstanceKeeper implements TileProvider, Serializa
      */
     public Set<Point> getCurrentRegions() {
         return collectCurrentRegions();
+    }
+
+    /** Magic bytes for the {@code <anchor>/tile-index.bin} entry: ASCII {@code 'WPIT'}. */
+    public static final int TILE_INDEX_MAGIC = 0x57504954;
+    /** Version of the {@code tile-index.bin} payload format. */
+    public static final int TILE_INDEX_VERSION = 1;
+
+    /**
+     * Write the {@code <anchor>/tile-index.bin} ZIP entry. The entry holds a flat list of every
+     * tile coordinate present in this dimension — about 8 bytes per tile, ~14 KB for a
+     * 1800-tile world. Lets the {@link org.pepsoft.worldpainter.paging.PagingTileMap}
+     * answer {@code containsKey} / {@code keySet} / {@code size} without ever opening a
+     * {@code region-data-X,Y.bin} entry.
+     *
+     * @see #writeTileIndexPayload(OutputStream)
+     */
+    private void writeTileIndexEntry(ZipOutputStream out) throws IOException {
+        final String path = anchor + "/";
+        out.putNextEntry(new ZipEntry(path + "tile-index.bin"));
+        try {
+            writeTileIndexPayload(out);
+        } finally {
+            out.closeEntry();
+        }
+    }
+
+    /**
+     * Just the bytes of the {@code tile-index.bin} entry — no surrounding ZIP entry framing.
+     * Public so {@link WorldIO#saveCompartmentalised} can use it on top of a
+     * {@code ZipArchiveOutputStream} (commons-compress) in the incremental save path.
+     *
+     * <p>Format: {@code int32 magic ('WPIT')}, {@code int32 version}, {@code int32 count},
+     * then {@code count * (int32 x, int32 y)}. All ints big-endian (Java
+     * {@link DataOutputStream#writeInt}).
+     */
+    public void writeTileIndexPayload(OutputStream out) throws IOException {
+        final DataOutputStream dout = new DataOutputStream(out);
+        dout.writeInt(TILE_INDEX_MAGIC);
+        dout.writeInt(TILE_INDEX_VERSION);
+        final Set<Point> coords = tiles.keySet();
+        dout.writeInt(coords.size());
+        for (Point p : coords) {
+            dout.writeInt(p.x);
+            dout.writeInt(p.y);
+        }
+        dout.flush();
+    }
+
+    /**
+     * Read a {@code tile-index.bin} payload back into a {@code Set<Point>}. Static because
+     * loading the index doesn't require an instance — {@link WorldIO#loadCompartmentalised}
+     * may want to peek the index before fully materialising the Dimension.
+     *
+     * @throws IOException if the stream doesn't start with {@link #TILE_INDEX_MAGIC} or carries
+     *     an unsupported version.
+     */
+    public static Set<Point> readTileIndexPayload(InputStream in) throws IOException {
+        final DataInputStream din = new DataInputStream(in);
+        final int magic = din.readInt();
+        if (magic != TILE_INDEX_MAGIC) {
+            throw new IOException(String.format(
+                    "tile-index.bin: bad magic 0x%08X (expected 0x%08X 'WPIT')", magic, TILE_INDEX_MAGIC));
+        }
+        final int version = din.readInt();
+        if (version != TILE_INDEX_VERSION) {
+            throw new IOException("tile-index.bin: unsupported version " + version
+                    + " (this build supports " + TILE_INDEX_VERSION + ")");
+        }
+        final int count = din.readInt();
+        if (count < 0) {
+            throw new IOException("tile-index.bin: negative count " + count);
+        }
+        final Set<Point> coords = new HashSet<>(Math.max(16, count * 2));
+        for (int i = 0; i < count; i++) {
+            final int x = din.readInt();
+            final int y = din.readInt();
+            coords.add(new Point(x, y));
+        }
+        return coords;
     }
 
     /**

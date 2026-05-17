@@ -6,16 +6,21 @@ import org.pepsoft.worldpainter.layers.Layer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.awt.Point;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /**
  * Headless smoke test for a real WorldPainter {@code .world} file. Loads a user-supplied
@@ -143,6 +148,10 @@ public class WorldFileSmokeTest extends AbstractTool {
             System.exit(4);
         }
         logger.info("Compartmentalised round-trip: PASSED");
+
+        // -------- 5a. B1 — tile-index.bin present and matches in-memory coord set --------
+        verifyTileIndex(zipOut, world);
+        logger.info("tile-index.bin per dim: PASSED");
 
         // -------- 5b. A3 — Layer identity preserved across ZIP boundary --------
         // Pre-A3: each ZIP entry was a fresh ObjectOutputStream, so the same CustomLayer ended up
@@ -331,6 +340,43 @@ public class WorldFileSmokeTest extends AbstractTool {
      * that two tiles referencing the same built-in {@code Layer} (by id) get the <em>same</em>
      * canonical instance — i.e., the canonical-instance count must match the unique-id count.
      */
+    /**
+     * Verify the {@code <anchor>/tile-index.bin} entry exists for every dimension in a freshly
+     * saved compartmentalised archive, and that its decoded {@code Set<Point>} matches the
+     * in-memory tile coord set on the corresponding live Dimension. Catches B1 regressions
+     * before they reach the consuming lazy loader in B2.
+     */
+    private static void verifyTileIndex(File zipFile, World2 world) throws IOException {
+        try (ZipFile zf = new ZipFile(zipFile)) {
+            for (Dimension dim : world.getDimensions()) {
+                final String entryName = dim.getAnchor() + "/tile-index.bin";
+                final ZipEntry entry = zf.getEntry(entryName);
+                if (entry == null) {
+                    logger.error("B1 FAILED: missing entry {}", entryName);
+                    System.exit(9);
+                }
+                final Set<Point> indexed;
+                try (InputStream in = zf.getInputStream(entry)) {
+                    indexed = Dimension.readTileIndexPayload(in);
+                }
+                final Set<Point> expected = new HashSet<>(dim.getTileCoords());
+                if (!indexed.equals(expected)) {
+                    final Set<Point> onlyIndex = new HashSet<>(indexed);
+                    onlyIndex.removeAll(expected);
+                    final Set<Point> onlyMem = new HashSet<>(expected);
+                    onlyMem.removeAll(indexed);
+                    logger.error("B1 FAILED: tile-index for {} doesn't match live tiles "
+                                    + "(only-in-index={}, only-in-memory={})",
+                            dim.getAnchor(), onlyIndex.size(), onlyMem.size());
+                    System.exit(9);
+                }
+                logger.info("tile-index.bin for {} dim: {} tile coords match in-memory set "
+                                + "({} bytes on disk)",
+                        dim.getAnchor(), indexed.size(), entry.getSize());
+            }
+        }
+    }
+
     private static void verifyLayerIdentityPreserved(World2 world) {
         // Build an identity map: layer-id -> first instance seen, plus a second map id -> set of
         // distinct instances. If the registry is doing its job, every set is size 1.
