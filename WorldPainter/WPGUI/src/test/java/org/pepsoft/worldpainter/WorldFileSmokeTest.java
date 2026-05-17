@@ -278,8 +278,121 @@ public class WorldFileSmokeTest extends AbstractTool {
         // -------- 8. B2 — lazy region paging round-trip --------
         verifyLazyLoad(zipOut, totalTiles);
 
-        // -------- 9. PR #478 microbenchmark --------
+        // -------- 9. B6 — RAM benchmark: lazy budget-cap vs budget-unlimited --------
+        // Run AFTER all prior state can be dropped to get the cleanest possible heap reading.
+        // The variables from the main() scope (world, reloaded, zipReloaded, ...) are still
+        // strongly reachable from the call stack, so we can't fully escape that footprint,
+        // but the DELTA between the two rounds inside this benchmark is what matters.
+        runB6RamBenchmark(zipOut);
+
+        // -------- 10. PR #478 microbenchmark --------
         runPr478Benchmark();
+    }
+
+    /**
+     * B6 — RAM benchmark. Loads Arag's compartmentalised world twice under lazy mode with
+     * different {@code residentRegionBudget} values, touches every tile coord, and reports
+     * heap delta vs a freshly-GC'd baseline at each step. Demonstrates that peak RAM scales
+     * with the budget rather than world size.
+     *
+     * <p>Heap measurements are noisy (other test scope variables still reachable, JIT
+     * compilation, etc.); the round-vs-round DELTA is the interesting number.
+     */
+    private static void runB6RamBenchmark(File zipFile) throws IOException, UnloadableWorldException {
+        logger.info("=== B6 RAM benchmark ===");
+        final Configuration cfg = Configuration.getInstance();
+        final boolean priorFlag = cfg.isRegionPagingEnabled();
+        final int priorBudget = cfg.getResidentRegionBudget();
+        cfg.setRegionPagingEnabled(true);
+        try {
+            // Settle baseline.
+            final long heapBaseline = measureHeapBytes();
+            logger.info("Heap baseline (after main test state still reachable): {} MB",
+                    heapBaseline / 1_048_576L);
+
+            // Round A: large budget — every region resident after a full coord walk.
+            cfg.setResidentRegionBudget(10000);
+            final HeapRound roundA = runOneB6Round(zipFile, "budget=10000 (unlimited)");
+
+            // Round B: tight budget — at most 10 regions resident at any time.
+            cfg.setResidentRegionBudget(10);
+            final HeapRound roundB = runOneB6Round(zipFile, "budget=10");
+
+            final long savedBytes = roundA.heapAfterTouch - roundB.heapAfterTouch;
+            logger.info("RAM delta (budget=10000 → budget=10 after touching every coord): "
+                            + "{} MB saved",
+                    savedBytes / 1_048_576L);
+            if (savedBytes <= 0) {
+                logger.warn("B6: tight budget did NOT reduce heap — measurement may be too noisy "
+                        + "(small world or other state dominates). Check 'loaded resident' counts.");
+            } else {
+                logger.info("B6 RAM benchmark: tight budget DID reduce peak heap");
+            }
+        } finally {
+            cfg.setRegionPagingEnabled(priorFlag);
+            cfg.setResidentRegionBudget(priorBudget);
+        }
+    }
+
+    private static HeapRound runOneB6Round(File zipFile, String label)
+            throws IOException, UnloadableWorldException {
+        final long heapPre = measureHeapBytes();
+
+        final WorldIO io = new WorldIO();
+        io.load(zipFile);
+        final World2 world = io.getWorld();
+        final Dimension dim = world.getDimensions().iterator().next();
+
+        final long heapAfterOpen = measureHeapBytes();
+        final int loadedAfterOpen = dim.getTilePager() != null ? dim.getTilePager().getLoadedRegionCount() : -1;
+        logger.info("[{}] heap after lazy-open: {} MB (delta {} MB; {} regions loaded)",
+                label,
+                heapAfterOpen / 1_048_576L,
+                (heapAfterOpen - heapPre) / 1_048_576L,
+                loadedAfterOpen);
+
+        // Touch every coord once — for budget=10000 this fully populates resident; for budget=10
+        // it thrashes the LRU and ends with 10 regions resident.
+        for (Point coord : new HashSet<>(dim.getTileCoords())) {
+            dim.getTile(coord);
+        }
+        final long heapAfterTouch = measureHeapBytes();
+        final int loadedAfterTouch = dim.getTilePager() != null ? dim.getTilePager().getLoadedRegionCount() : -1;
+        final long evictions = dim.getTilePager() != null ? dim.getTilePager().getTotalEvictionCount() : 0;
+        final long loads = dim.getTilePager() != null ? dim.getTilePager().getTotalLoadCount() : 0;
+        logger.info("[{}] heap after touching every coord: {} MB (delta {} MB; {} resident at end, "
+                        + "{} loads / {} evictions)",
+                label,
+                heapAfterTouch / 1_048_576L,
+                (heapAfterTouch - heapPre) / 1_048_576L,
+                loadedAfterTouch, loads, evictions);
+
+        world.closeLazyResources();
+        return new HeapRound(loadedAfterOpen, loadedAfterTouch, heapAfterOpen, heapAfterTouch);
+    }
+
+    /** Result holder for one B6 round. */
+    private static final class HeapRound {
+        final int loadedAfterOpen, loadedAfterTouch;
+        final long heapAfterOpen, heapAfterTouch;
+        HeapRound(int loadedAfterOpen, int loadedAfterTouch, long heapAfterOpen, long heapAfterTouch) {
+            this.loadedAfterOpen = loadedAfterOpen;
+            this.loadedAfterTouch = loadedAfterTouch;
+            this.heapAfterOpen = heapAfterOpen;
+            this.heapAfterTouch = heapAfterTouch;
+        }
+    }
+
+    /**
+     * Best-effort heap-used measurement. Several GCs to settle, then read
+     * {@code totalMemory()-freeMemory()}. Result is noisy; use deltas, not absolute values.
+     */
+    private static long measureHeapBytes() {
+        for (int i = 0; i < 3; i++) {
+            System.gc();
+            try { Thread.sleep(40); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        return Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
     }
 
     /**
