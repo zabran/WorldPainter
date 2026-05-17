@@ -92,6 +92,10 @@ public class PreferencesDialog extends WorldPainterDialog {
         ((SpinnerNumberModel) spinnerManualThreadCount.getModel()).setMaximum(logicalProcessorCount);
         spinnerManualThreadCount.setValue(logicalProcessorCount);
 
+        // B3b: "Large Maps" tab — lazy region paging knobs. Added programmatically so we don't
+        // need to touch PreferencesDialog.form (the NetBeans builder file).
+        buildLargeMapsTab();
+
         loadSettings();
         
         rootPane.setDefaultButton(buttonOK);
@@ -232,6 +236,13 @@ public class PreferencesDialog extends WorldPainterDialog {
             spinnerFreeSpaceForMaps.setValue(config.getMinimumFreeSpaceForMaps());
             checkBoxAutoDeleteBackups.setSelected(config.isAutoDeleteBackups());
 
+            // B3b: Large Maps tab
+            if (checkBoxRegionPaging != null) {
+                checkBoxRegionPaging.setSelected(config.isRegionPagingEnabled());
+                final int budget = config.getResidentRegionBudget();
+                spinnerResidentRegionBudget.setValue(budget > 0 ? budget : 256);
+            }
+
             final String sysProp = System.getProperty("org.pepsoft.worldpainter.threads");
             final boolean maxThreadCountFixed = sysProp != null;
             if (maxThreadCountFixed) {
@@ -352,6 +363,12 @@ public class PreferencesDialog extends WorldPainterDialog {
         config.setMinimumFreeSpaceForMaps((Integer) spinnerFreeSpaceForMaps.getValue());
         config.setAutoDeleteBackups(checkBoxAutoDeleteBackups.isSelected());
 
+        // B3b: Large Maps tab
+        if (checkBoxRegionPaging != null) {
+            config.setRegionPagingEnabled(checkBoxRegionPaging.isSelected());
+            config.setResidentRegionBudget((Integer) spinnerResidentRegionBudget.getValue());
+        }
+
         config.setDefaultExportSettings(defaultExportSettings);
         config.setDefaultResourcesMinimumLevel(checkBoxResourcesEverywhere.isSelected() ? 8 : 0);
 
@@ -393,7 +410,74 @@ public class PreferencesDialog extends WorldPainterDialog {
         spinnerAutoSaveInterval.setEnabled(autosaveEnabled && (! autosaveInhibited));
         sliderUIScale.setEnabled(radioButtonUIScaleManual.isSelected());
         spinnerManualThreadCount.setEnabled(radioButtonThreadCountManual.isSelected() && radioButtonThreadCountManual.isEnabled());
+        // B3b
+        if (spinnerResidentRegionBudget != null) {
+            spinnerResidentRegionBudget.setEnabled(checkBoxRegionPaging.isSelected());
+        }
     }
+
+    /**
+     * B3b — build the "Large Maps" tab programmatically (not via the NetBeans .form file so we
+     * don't have to touch the GUI builder). Two controls + an explanatory paragraph:
+     * <ul>
+     *   <li>{@code checkBoxRegionPaging} — toggles {@code Configuration.regionPagingEnabled}.
+     *       Opt-in, default off. Effective on next world open.</li>
+     *   <li>{@code spinnerResidentRegionBudget} — bounds resident regions for the LRU cache.
+     *       Disabled when lazy mode is off.</li>
+     * </ul>
+     */
+    private void buildLargeMapsTab() {
+        checkBoxRegionPaging = new javax.swing.JCheckBox("Enable lazy region paging for large maps");
+        checkBoxRegionPaging.setToolTipText("<html>Opens compartmentalised .world.zip files without "
+                + "loading every tile up front.<br>Reduces startup time and peak RAM at the cost of "
+                + "per-region load latency on first access.<br>Effective on next world open.</html>");
+        spinnerResidentRegionBudget = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(256, 16, 4096, 16));
+        spinnerResidentRegionBudget.setToolTipText("<html>Maximum 4×4 tile regions kept in memory at once.<br>"
+                + "Each region holds up to 16 tiles. 256 regions ≈ 1-4 GB peak.<br>"
+                + "Dirty (edited) regions are pinned and never evicted.</html>");
+
+        checkBoxRegionPaging.addActionListener(e -> setControlStates());
+
+        final javax.swing.JPanel inner = new javax.swing.JPanel(new java.awt.GridBagLayout());
+        inner.setBorder(javax.swing.BorderFactory.createTitledBorder("Lazy region paging"));
+        final java.awt.GridBagConstraints gbc = new java.awt.GridBagConstraints();
+        gbc.insets = new java.awt.Insets(4, 4, 4, 4);
+        gbc.anchor = java.awt.GridBagConstraints.WEST;
+
+        gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 2; gbc.fill = java.awt.GridBagConstraints.HORIZONTAL;
+        inner.add(checkBoxRegionPaging, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 1; gbc.gridwidth = 1; gbc.fill = java.awt.GridBagConstraints.NONE;
+        inner.add(new javax.swing.JLabel("Maximum resident regions:"), gbc);
+        gbc.gridx = 1;
+        inner.add(spinnerResidentRegionBudget, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 2; gbc.gridwidth = 2; gbc.fill = java.awt.GridBagConstraints.HORIZONTAL;
+        inner.add(new javax.swing.JLabel("<html><i>Effective on next world open</i></html>"), gbc);
+
+        gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 2; gbc.fill = java.awt.GridBagConstraints.BOTH;
+        gbc.weightx = 1.0; gbc.weighty = 1.0;
+        inner.add(new javax.swing.JLabel("<html>"
+                + "<b>When this is on:</b> opening a compartmentalised .world.zip file reads only "
+                + "the tile coordinate index (cheap) and defers tile-body deserialisation until each "
+                + "region is accessed. Cuts cold-load time substantially and lets very large maps "
+                + "fit in RAM that wouldn't otherwise.<br><br>"
+                + "<b>Dirty regions are pinned</b> against eviction, so unsaved edits are safe.<br><br>"
+                + "<b>Effect of saving</b>: the first save of a lazy-loaded world loads every region "
+                + "into memory and closes the source archive. After that save the world is "
+                + "fully resident for the rest of the session; re-open the file to regain the "
+                + "budget cap.</html>"), gbc);
+
+        final javax.swing.JPanel tab = new javax.swing.JPanel(new java.awt.BorderLayout());
+        tab.setBorder(javax.swing.BorderFactory.createEmptyBorder(8, 8, 8, 8));
+        tab.add(inner, java.awt.BorderLayout.NORTH);
+
+        jTabbedPane1.addTab("Large Maps", tab);
+    }
+
+    /** B3b — fields for the "Large Maps" tab, populated by {@link #buildLargeMapsTab}. */
+    private javax.swing.JCheckBox checkBoxRegionPaging;
+    private javax.swing.JSpinner spinnerResidentRegionBudget;
 
     private void updateLabelUIScale() {
         if (radioButtonUIScaleAuto.isSelected()) {
