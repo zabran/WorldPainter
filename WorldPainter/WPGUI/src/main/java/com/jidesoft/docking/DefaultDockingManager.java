@@ -170,14 +170,32 @@ public class DefaultDockingManager implements DockingManager {
         if (!layoutDeployed) {
             deployInitialLayout();
         } else {
-            // Subsequent reset: tear down and redeploy. Simplest: rebuild from frames map.
-            for (DefaultSingleCDockable d : new ArrayList<>(dockables.values())) {
-                control.removeDockable(d);
-            }
-            dockables.clear();
-            layoutDeployed = false;
+            tearDownDeployedLayout();
             deployInitialLayout();
         }
+    }
+
+    /**
+     * Remove every dockable we added during {@link #deployInitialLayout} from the {@link CControl},
+     * clear our internal {@code dockables} map, and reset {@code layoutDeployed} to {@code false}.
+     * The next call to {@code deployInitialLayout} will rebuild from scratch using the current
+     * (possibly imported-from-JIDE) {@code initSide}/{@code initIndex} values on each frame.
+     *
+     * <p>Crucial detail: the workspace dockable ({@code wp.workspace}) is added by deployInitialLayout
+     * via {@code grid.add(workspaceDockable)} but isn't in our per-frame {@code dockables} map.
+     * We have to look it up by id and remove it explicitly, otherwise the next deploy throws
+     * {@code IllegalArgumentException: unique id 'wp.workspace' already in use}.
+     */
+    private void tearDownDeployedLayout() {
+        for (DefaultSingleCDockable d : new ArrayList<>(dockables.values())) {
+            control.removeDockable(d);
+        }
+        dockables.clear();
+        final bibliothek.gui.dock.common.SingleCDockable workspace = control.getSingleDockable(WORKSPACE_ID);
+        if (workspace instanceof DefaultSingleCDockable) {
+            control.removeDockable((DefaultSingleCDockable) workspace);
+        }
+        layoutDeployed = false;
     }
 
     @Override
@@ -192,46 +210,58 @@ public class DefaultDockingManager implements DockingManager {
             return;
         }
 
-        // ----- JIDE-import fast path (must run BEFORE the initial layout deploys) -------------
+        // ----- JIDE-import fast path -----------------------------------------------------------
         // A release-WP user's config carries layout bytes in the proprietary JIDE Docking
         // Framework binary format. We extract:
-        //   - panel → (side, index) — wired pre-deploy via DockableFrame.set{InitSide,InitIndex}
+        //   - panel → (side, index) — written into each DockableFrame's init fields before deploy
         //   - panel → mode (DOCKED/AUTOHIDE/FLOATING) — applied post-deploy via setExtendedMode
-        // For subsequent per-dimension layout loads after deployment, it's the DockingFrames
-        // CControl.read path that takes over.
-        if (!layoutDeployed) {
-            java.util.Map<String, JideLayoutImporter.FramePlacement> jidePlacements = null;
-            try {
-                jidePlacements = JideLayoutImporter.tryParse(bytes);
-                if (jidePlacements != null) {
-                    // (a) Write (side, index) onto each frame's init fields BEFORE deploy.
-                    int applied = 0;
-                    for (java.util.Map.Entry<String, JideLayoutImporter.FramePlacement> e : jidePlacements.entrySet()) {
-                        final DockableFrame f = frames.get(e.getKey());
-                        if (f != null) {
-                            f.setInitSide(e.getValue().toDockContextSide());
-                            f.setInitIndex(e.getValue().index);
-                            applied++;
-                        }
-                    }
-                    logger.info("Restoring layout from JIDE bytes — applied {} of {} placement(s).",
-                            applied, jidePlacements.size());
+        //
+        // Runs for both first-load (layout never deployed) AND subsequent per-dim loads
+        // (layout already deployed by a previous resetToDefault / deployInitialLayout). The
+        // second case is the common one: App.java loads the default layout via resetToDefault,
+        // then later calls loadLayoutFrom with the per-dim JIDE bytes when the user opens a
+        // world — by that point the deploy has already happened with built-in defaults. To
+        // apply the imported placement we tear the dockables down and redeploy, exactly the
+        // same dance resetToDefault uses for its own re-deploy branch.
+        java.util.Map<String, JideLayoutImporter.FramePlacement> jidePlacements = null;
+        try {
+            jidePlacements = JideLayoutImporter.tryParse(bytes);
+        } catch (RuntimeException e) {
+            logger.warn("JIDE-import parse threw; falling back to DockingFrames decode.", e);
+            jidePlacements = null;
+        }
+        if (jidePlacements != null) {
+            // (a) Apply (side, index) to each frame's init fields. Has to happen before any
+            // deploy so the deploy reads the imported values.
+            int applied = 0;
+            for (java.util.Map.Entry<String, JideLayoutImporter.FramePlacement> e : jidePlacements.entrySet()) {
+                final DockableFrame f = frames.get(e.getKey());
+                if (f != null) {
+                    f.setInitSide(e.getValue().toDockContextSide());
+                    f.setInitIndex(e.getValue().index);
+                    applied++;
                 }
-            } catch (RuntimeException e) {
-                logger.warn("JIDE-import parse threw; falling back to DockingFrames decode.", e);
-                jidePlacements = null;
             }
+            logger.info("Restoring layout from JIDE bytes — applied {} of {} placement(s).",
+                    applied, jidePlacements.size());
 
+            // (b) Deploy (or redeploy if we'd already deployed something).
+            if (layoutDeployed) {
+                tearDownDeployedLayout();
+            }
             deployInitialLayout();
 
-            // (b) Apply modes (AUTOHIDE / FLOATING) to dockables now that they exist. These
-            // calls are no-ops for panels we want to stay DOCKED (the default after deploy).
-            if (jidePlacements != null) {
-                applyJideModesPostDeploy(jidePlacements);
-                return; // skip CControl.read — we've placed everything from the JIDE bytes
-            }
+            // (c) Apply modes (AUTOHIDE → MINIMIZED, FLOATING → EXTERNALIZED). DOCKED stays
+            // NORMALIZED (the deploy default).
+            applyJideModesPostDeploy(jidePlacements);
+            return;
         }
 
+        // Not JIDE — try DockingFrames' own CControl.read. If the layout hasn't been deployed
+        // yet, deploy with defaults first so CControl.read has something to apply onto.
+        if (!layoutDeployed) {
+            deployInitialLayout();
+        }
         try (DataInputStream dis = new DataInputStream(new java.io.ByteArrayInputStream(bytes))) {
             control.read(dis);
         } catch (IOException | RuntimeException e) {

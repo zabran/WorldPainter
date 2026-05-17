@@ -675,13 +675,22 @@ public final class App extends JFrame implements BrushControl,
             updateZoomLabel();
             updateRadiusLabel();
 
-            // Restore the saved DockingFrames layout for this dimension (if any). The separate
-            // dockingFramesLayoutData field keeps our state independent of release WP's JIDE
-            // bytes — see the writer at App.java's earlier dim-switch site.
-            final Map<String, byte[]> layoutData = config.getDockingFramesLayoutData();
+            // Restore the saved per-dim layout. Prefer our DockingFrames bytes; if absent, fall
+            // back to release WP's JIDE bytes (the DockingManager's loadLayoutFrom auto-detects
+            // and parses either format via JideLayoutImporter — first-launch migration case).
             final String key = dimension.getId().toString();
-            if ((layoutData != null) && layoutData.containsKey(key)) {
-                dockingManager.loadLayoutFrom(new ByteArrayInputStream(layoutData.get(key)));
+            byte[] dimLayout = null;
+            final Map<String, byte[]> dfData = config.getDockingFramesLayoutData();
+            if (dfData != null && dfData.containsKey(key)) {
+                dimLayout = dfData.get(key);
+            } else {
+                final Map<String, byte[]> jideData = config.getJideLayoutData();
+                if (jideData != null && jideData.containsKey(key)) {
+                    dimLayout = jideData.get(key);
+                }
+            }
+            if (dimLayout != null) {
+                dockingManager.loadLayoutFrom(new ByteArrayInputStream(dimLayout));
                 // This works around a bug in JIDE that otherwise causes painting to be shifted if this resulted in
                 // resized docks:
                 view.componentResized(new ComponentEvent(view, COMPONENT_RESIZED));
@@ -2809,7 +2818,14 @@ public final class App extends JFrame implements BrushControl,
         dockingManager.addFrame(new DockableFrameBuilder(infoPanel, "Info", DOCK_SIDE_EAST, 2).withId("infoPanel").expand().withIcon(loadScaledIcon("information")).build());
 
         if (config.getDefaultDockingFramesLayoutData() != null) {
+            // Our fork's own DockingFrames bytes — preferred path.
             dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultDockingFramesLayoutData()));
+        } else if (config.getDefaultJideLayoutData() != null) {
+            // First launch of our fork against an existing release-WP config: the JIDE bytes are
+            // here and our DockingFrames bytes haven't been written yet. Pass them through —
+            // DockingManager.loadLayoutFrom has JIDE-import fallback that parses the JIDE
+            // format and reconstructs the panel arrangement.
+            dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultJideLayoutData()));
         } else {
             dockingManager.resetToDefault();
         }
