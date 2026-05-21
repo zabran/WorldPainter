@@ -12,6 +12,7 @@ import org.jetbrains.annotations.NotNull;
 import org.pepsoft.util.IconUtils;
 import org.pepsoft.worldpainter.layers.CustomLayer;
 import org.pepsoft.worldpainter.layers.Layer;
+import org.pepsoft.worldpainter.util.AutoPanelIcon;
 import org.pepsoft.worldpainter.util.DockableFrameBuilder;
 import org.pepsoft.worldpainter.util.LayoutUtils;
 
@@ -76,7 +77,13 @@ public class Palette {
         // Row: components provided to constructor
         LayoutUtils.addRowOfComponents(panel, constraints, buttonComponents);
 
-        dockableFrame = new DockableFrameBuilder(panel, name, DockContext.DOCK_SIDE_WEST, 3).withIcon(ICON_LAYERS).scrollable().build();
+        // Task 8: each custom-layer palette gets its own auto-generated icon (letter+colour
+        // derived from the palette name) so they're distinguishable in the side dock. Until
+        // this change every palette inherited a shared ICON_LAYERS, making them look identical
+        // to each other and to the standard Layers panel. The solo / not-shown special-state
+        // icons (set in setShow/setSolo below) are unchanged — they signal state, not identity.
+        autoIcon = AutoPanelIcon.generate(name);
+        dockableFrame = new DockableFrameBuilder(panel, name, DockContext.DOCK_SIDE_WEST, 3).withIcon(autoIcon).scrollable().build();
         dockableFrame.setKey("customLayerPalette." + name);
     }
 
@@ -92,6 +99,14 @@ public class Palette {
         dockableFrame.setTitle(name);
         dockableFrame.setTabTitle(name);
         dockableFrame.setKey("customLayerPalette." + name);
+        // Task 8: regenerate the auto-icon so the new name's letter+colour is shown. Skip
+        // when the palette is currently in solo or hidden state — those icons signal state,
+        // not identity, and the next setShow/setSolo call will rebuild the visible icon
+        // from the new autoIcon anyway.
+        autoIcon = AutoPanelIcon.generate(name);
+        if (!solo && show) {
+            dockableFrame.setFrameIcon(autoIcon);
+        }
     }
 
     public List<CustomLayer> getLayers() {
@@ -106,7 +121,7 @@ public class Palette {
         this.show = show;
         showCheckBox.setSelected(show);
         propertyChangeSupport.firePropertyChange("show", ! showCheckBox.isSelected(), showCheckBox.isSelected());
-        dockableFrame.setFrameIcon(solo ? ICON_SOLO : (show ? ICON_LAYERS : ICON_NOT_SHOWN));
+        dockableFrame.setFrameIcon(solo ? ICON_SOLO : (show ? autoIcon : ICON_NOT_SHOWN));
     }
 
     public boolean isSolo() {
@@ -117,7 +132,7 @@ public class Palette {
         this.solo = solo;
         soloCheckBox.setSelected(solo);
         propertyChangeSupport.firePropertyChange("solo", ! soloCheckBox.isSelected(), soloCheckBox.isSelected());
-        dockableFrame.setFrameIcon(solo ? ICON_SOLO : (show ? ICON_LAYERS : ICON_NOT_SHOWN));
+        dockableFrame.setFrameIcon(solo ? ICON_SOLO : (show ? autoIcon : ICON_NOT_SHOWN));
     }
 
     @SuppressWarnings("element-type-mismatch")
@@ -203,7 +218,13 @@ public class Palette {
     private String name;
     private boolean show = true, solo;
 
-    private static final Icon ICON_LAYERS    = IconUtils.loadScaledIcon("org/pepsoft/worldpainter/icons/layers.png");
+    /**
+     * Task 8: per-palette auto-icon (letter + deterministic colour from the palette name).
+     * Replaces the static ICON_LAYERS so each palette is visually distinguishable. Re-derived
+     * on {@link #setName} when the palette is renamed.
+     */
+    private Icon autoIcon;
+
     private static final Icon ICON_NOT_SHOWN = IconUtils.loadScaledIcon("org/pepsoft/worldpainter/icons/cross.png");
     private static final Icon ICON_SOLO      = IconUtils.loadScaledIcon("org/pepsoft/worldpainter/icons/tick.png");
     private static final Icon ICON_EDIT      = IconUtils.loadScaledIcon("org/pepsoft/worldpainter/icons/cog.png");

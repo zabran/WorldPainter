@@ -52,6 +52,10 @@ public class DefaultDockingManager implements DockingManager {
     private static final Logger logger = LoggerFactory.getLogger(DefaultDockingManager.class);
     private static final String WORKSPACE_ID = "wp.workspace";
 
+    /** U4: default autohide popup size, shared across all panels on the same flap station. */
+    private static final int DEFAULT_FLAP_WIDTH_PX  = 280;
+    private static final int DEFAULT_FLAP_HEIGHT_PX = 200;
+
     private final CControl   control;
     private final Workspace  workspace;
 
@@ -99,6 +103,27 @@ public class DefaultDockingManager implements DockingManager {
         control.putProperty(
                 StackDockStation.TAB_CONTENT_FILTER,
                 new DefaultTabContentFilter(DefaultTabContentFilter.Behavior.ICON_ONLY));
+
+        // B3: WP owns its keymap; DockingFrames Common's panel-management keybindings shadow
+        // WP's existing application shortcuts. Defaults: Ctrl+E = goto externalized, Ctrl+N =
+        // goto normalized, Ctrl+M = goto minimized/maximized, Ctrl+F4 = close. WP needs Ctrl+E
+        // for Export and Ctrl+N for New world. The original JIDE Docking framework didn't bind
+        // any of these — release WP users expect their existing shortcuts. Unbinding globally
+        // here; drag-drop, title-bar buttons, and right-click menus remain functional.
+        //
+        // Use an unreachable KeyStroke (F24 with all modifiers) rather than null, since some
+        // DockingFrames versions treat null as "restore default" rather than "unbind". F24 is
+        // a key only a few specialised programmer keyboards have, and the modifier combination
+        // is one no user would press by accident.
+        //
+        // Reported by Arag 2026-05-18: Ctrl+E externalized the map area instead of opening
+        // Export, leaving him with no way to get the map back into the workspace.
+        final javax.swing.KeyStroke unbound = javax.swing.KeyStroke.getKeyStroke("ctrl alt shift F24");
+        control.putProperty(CControl.KEY_GOTO_EXTERNALIZED, unbound);
+        control.putProperty(CControl.KEY_GOTO_NORMALIZED, unbound);
+        control.putProperty(CControl.KEY_GOTO_MINIMIZED, unbound);
+        control.putProperty(CControl.KEY_GOTO_MAXIMIZED, unbound);
+        control.putProperty(CControl.KEY_CLOSE, unbound);
     }
 
     @Override public JComponent getMainContainer() { return control.getContentArea(); }
@@ -113,6 +138,29 @@ public class DefaultDockingManager implements DockingManager {
         frames.put(frame.getKey(), frame);
         if (layoutDeployed) {
             installFrameLive(frame);
+            // Task 8: if a global icon-chooser launcher is registered, auto-attach the
+            // "Change icon..." action to this newly-added dockable too. This is the path
+            // taken by post-deploy addFrame calls — most notably custom layer palettes
+            // registered after a world is loaded (CustomLayerController.registerCustomLayer).
+            // Pre-deploy addFrames are covered by the sweep inside attachIconChooserActionToAll
+            // which runs after the deploy finishes.
+            if (globalIconChooserLauncher != null) {
+                final String panelId = frame.getKey();
+                final String panelTitle = frame.getTitle();
+                attachIconChooserAction(panelId, () -> globalIconChooserLauncher.accept(panelId, panelTitle));
+            }
+            // Task 8: apply any stored icon override to this newly-added dockable too. Same
+            // mechanism applyIconOverridesToAll uses for the bulk pass at end of setup; this
+            // is the per-frame variant for post-deploy registrations (custom layer palettes
+            // added after world load).
+            if (globalIconResolver != null) {
+                final String panelId = frame.getKey();
+                final String panelTitle = frame.getTitle();
+                final javax.swing.Icon override = globalIconResolver.apply(panelId, panelTitle);
+                if (override != null) {
+                    setFrameIcon(panelId, override);
+                }
+            }
         }
     }
 
@@ -283,11 +331,40 @@ public class DefaultDockingManager implements DockingManager {
             return;
         }
 
-        // Not JIDE — try DockingFrames' own CControl.read. If the layout hasn't been deployed
-        // yet, deploy with defaults first so CControl.read has something to apply onto.
+        // Not JIDE. Deploy default first if not yet deployed, so reads have something to apply onto.
         if (!layoutDeployed) {
             deployInitialLayout();
         }
+
+        // B2: prefer the XML format (current path) — it's per-resource version-aware and avoids
+        // the binary format's "Unknown format for version" failures during round-trip. Detect XML
+        // by the leading '<' or whitespace-then-'<' (BOM stripping happens inside XIO.readUTF).
+        // Falls back to the binary format if XML parsing fails — handles existing user configs
+        // from before this change that were saved in the binary format.
+        boolean looksLikeXml = false;
+        for (int i = 0; i < bytes.length; i++) {
+            byte b = bytes[i];
+            if (b == '<') {
+                looksLikeXml = true;
+                break;
+            }
+            if (b != ' ' && b != '\t' && b != '\r' && b != '\n' && b != (byte) 0xEF && b != (byte) 0xBB && b != (byte) 0xBF) {
+                // Non-whitespace, non-BOM character before '<' — not XML.
+                break;
+            }
+        }
+        if (looksLikeXml) {
+            try {
+                final bibliothek.util.xml.XElement root = bibliothek.util.xml.XIO.readUTF(new java.io.ByteArrayInputStream(bytes));
+                control.readXML(root);
+                logger.info("Applied saved docking layout (XML, {} bytes)", bytes.length);
+                return;
+            } catch (IOException | RuntimeException e) {
+                logger.info("Saved layout is not XML ({}); falling back to legacy binary format", e.toString());
+            }
+        }
+
+        // Binary fallback (legacy / pre-B2-XML saves).
         try (DataInputStream dis = new DataInputStream(new java.io.ByteArrayInputStream(bytes))) {
             control.read(dis);
         } catch (IOException | RuntimeException e) {
@@ -338,19 +415,14 @@ public class DefaultDockingManager implements DockingManager {
             try {
                 switch (e.getValue().mode) {
                     case JideLayoutImporter.MODE_AUTOHIDE:
-                        // (a) Constrain the popup size for autohide. Without this, DockingFrames
-                        // expands the popup to fill the available flap-station area, which can
-                        // mean the whole app width if the panel ends up in the north/south flap.
-                        final DockableFrame autohideFrame = frames.get(e.getKey());
-                        if (autohideFrame != null) {
-                            final java.awt.Dimension pref = autohideFrame.getPreferredSize();
-                            if (pref != null && pref.width > 0 && pref.height > 0) {
-                                d.setMinimizedSize(pref);
-                            } else {
-                                d.setMinimizedSize(new java.awt.Dimension(250, 400));
-                            }
-                        }
-                        // (b) Explicitly target the correct flap station. By default
+                        // U4: per-dockable setMinimizedSize used to be set here from each panel's
+                        // preferred size. Removed because it overrode the per-station default set
+                        // in deployInitialLayout — so each panel popped open at its own width
+                        // instead of the shared per-side width Arag wanted. The station default
+                        // (DEFAULT_FLAP_WIDTH_PX / DEFAULT_FLAP_HEIGHT_PX) now applies to every
+                        // autohide popup unless the user explicitly resizes one (DockingFrames
+                        // remembers per-dockable user resizes; that's expected and acceptable).
+                        // Explicitly target the correct flap station. By default
                         // setExtendedMode(MINIMIZED) sends the dockable to whichever flap is
                         // "closest" to its current location — at grid (0, 0) that ends up being
                         // the NORTH flap (under the toolbar, app-wide), not the WEST one where
@@ -428,18 +500,118 @@ public class DefaultDockingManager implements DockingManager {
     }
 
     @Override
+    public void attachIconChooserAction(String panelId, Runnable onChooseIcon) {
+        if ((panelId == null) || (onChooseIcon == null)) {
+            return;
+        }
+        final DefaultSingleCDockable d = dockables.get(panelId);
+        if (d == null) {
+            logger.debug("attachIconChooserAction: no dockable registered for id '{}'", panelId);
+            return;
+        }
+        // Task 8: CButton appears in DockingFrames Common's native title-bar context menu
+        // (the one with Minimize / Externalize that the user already sees on right-click).
+        // setText supplies the menu item label; setTooltip supplies the hover text. The
+        // listener fires on either menu pick or title-bar button click (theme-dependent).
+        final bibliothek.gui.dock.common.action.CButton btn =
+                new bibliothek.gui.dock.common.action.CButton();
+        btn.setText("Change icon...");
+        btn.setTooltip("Pick or restore the icon shown on this panel's tab/title");
+        btn.addActionListener(e -> onChooseIcon.run());
+        d.addAction(btn);
+    }
+
+    @Override
+    public void setFrameIcon(String panelId, javax.swing.Icon icon) {
+        if (panelId == null) {
+            return;
+        }
+        final DefaultSingleCDockable d = dockables.get(panelId);
+        if (d != null) {
+            d.setTitleIcon(icon);
+        }
+    }
+
+    @Override
+    public void attachIconChooserActionToAll(java.util.function.BiConsumer<String, String> pickerLauncher) {
+        this.globalIconChooserLauncher = pickerLauncher;
+        if (pickerLauncher == null) {
+            return;
+        }
+        // Attach to every dockable currently registered (i.e. all standard panels installed
+        // during deployInitialLayout, plus any custom panels added pre-deploy).
+        for (Map.Entry<String, DefaultSingleCDockable> e : dockables.entrySet()) {
+            final String pid = e.getKey();
+            final DockableFrame f = frames.get(pid);
+            final String pt = (f != null) ? f.getTitle() : pid;
+            attachIconChooserAction(pid, () -> pickerLauncher.accept(pid, pt));
+        }
+        logger.info("attachIconChooserActionToAll: wired 'Change icon...' to {} dockable(s)",
+                dockables.size());
+    }
+
+    /**
+     * Task 8: when set, every {@link #addFrame} call that lands AFTER deploy auto-attaches
+     * the "Change icon..." action to the new dockable. Lets custom layer palettes (which are
+     * created post-world-load via {@code CustomLayerController.registerCustomLayer} → addFrame)
+     * pick up the action without the caller needing to know about it.
+     */
+    private java.util.function.BiConsumer<String, String> globalIconChooserLauncher;
+
+    @Override
+    public void applyIconOverridesToAll(java.util.function.BiFunction<String, String, javax.swing.Icon> iconResolver) {
+        this.globalIconResolver = iconResolver;
+        if (iconResolver == null) {
+            return;
+        }
+        int applied = 0;
+        for (Map.Entry<String, DefaultSingleCDockable> e : dockables.entrySet()) {
+            final String pid = e.getKey();
+            final DockableFrame f = frames.get(pid);
+            final String pt = (f != null) ? f.getTitle() : pid;
+            final javax.swing.Icon icon = iconResolver.apply(pid, pt);
+            if (icon != null) {
+                e.getValue().setTitleIcon(icon);
+                applied++;
+            }
+        }
+        logger.info("applyIconOverridesToAll: applied {} stored override(s) across {} dockable(s)",
+                applied, dockables.size());
+    }
+
+    /**
+     * Task 8: when set, every {@link #addFrame} call that lands AFTER deploy invokes this
+     * resolver to look up any stored icon override for the new panel. Used so custom layer
+     * palettes registered after world load also get their stored override (if any) applied
+     * automatically at registration time.
+     */
+    private java.util.function.BiFunction<String, String, javax.swing.Icon> globalIconResolver;
+
+    @Override
     public byte[] getLayoutRawData() {
         if (!layoutDeployed) {
             return new byte[0];
         }
+        // B2: use the XML format instead of the binary DataOutputStream format. The binary
+        // format's `Version.read` rejects round-tripped bytes with `IOException: Unknown
+        // format for version` even when the top-level envelope is valid (first byte = 1) —
+        // somewhere a nested resource's own Version.read fails on a sub-stream. The XML
+        // format is per-resource version-aware via XML attributes and survives that edge
+        // case. Round-trip storage cost: ~5x larger byte[], but the layout descriptor is
+        // small (~10-50 KB) so it's negligible inside the much larger Configuration object.
+        //
+        // Backwards-compat: existing user configs hold the binary format. loadLayoutFrom()
+        // tries XML first, then falls back to the binary read for those legacy bytes — so
+        // upgrading WP doesn't nuke previously-saved layouts; the first save after upgrade
+        // re-writes them as XML and subsequent loads succeed cleanly.
         try {
+            bibliothek.util.xml.XElement root = new bibliothek.util.xml.XElement("root");
+            control.writeXML(root);
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try (DataOutputStream dos = new DataOutputStream(baos)) {
-                control.write(dos);
-            }
+            bibliothek.util.xml.XIO.writeUTF(root, baos);
             return baos.toByteArray();
         } catch (IOException e) {
-            logger.warn("Failed to serialise docking layout", e);
+            logger.warn("Failed to serialise docking layout (XML)", e);
             return new byte[0];
         }
     }
@@ -487,6 +659,22 @@ public class DefaultDockingManager implements DockingManager {
 
         control.getContentArea().deploy(grid);
         layoutDeployed = true;
+
+        // U4: set a shared default autohide popup size per flap station. Without this, each
+        // panel pops open at its own preferred-size width (set per-dockable via setMinimizedSize
+        // below) — Arag's complaint was that resizing one autohide popup didn't carry over to
+        // the others on the same side. FlapDockStation.setDefaultWindowSize(int) is the
+        // per-station default: every popup from that flap uses this size unless the dockable
+        // has its own explicit setWindowSize override.
+        //
+        // Values: 280 px for west/east (a comfortable panel width that doesn't dominate the map);
+        // 200 px for north/south (rare in WP — toolbars usually stay docked at top — but
+        // configured for completeness).
+        final CContentArea contentArea = control.getContentArea();
+        contentArea.getWestArea().getStation().setDefaultWindowSize(DEFAULT_FLAP_WIDTH_PX);
+        contentArea.getEastArea().getStation().setDefaultWindowSize(DEFAULT_FLAP_WIDTH_PX);
+        contentArea.getNorthArea().getStation().setDefaultWindowSize(DEFAULT_FLAP_HEIGHT_PX);
+        contentArea.getSouthArea().getStation().setDefaultWindowSize(DEFAULT_FLAP_HEIGHT_PX);
 
         // Workaround for JScrollPane preferred-size caching: panels initially in the BACK of a
         // tab stack never get their JScrollPane laid out against a real viewport size, so their

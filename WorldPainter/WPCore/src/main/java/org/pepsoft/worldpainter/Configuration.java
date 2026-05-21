@@ -573,6 +573,21 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
         this.dockingFramesLayoutData = data;
     }
 
+    // Task 8: per-panel icon overrides for user-created dock panels (custom brush groups).
+    // Map<dockable-id → sentinel-prefixed icon reference>:
+    //   "builtin:NAME"   → load NAME from bundled WP icons via IconUtils.loadScaledIcon
+    //   "file:ABSOLUTE"  → load the file from disk; if missing, fall back to auto-generated
+    // Panels without an entry get an auto-generated letter+color icon derived from the
+    // panel name. Standard panels (Tools/Layers/etc.) don't have entries either — they keep
+    // their default DockingFrames look unchanged.
+    public synchronized Map<String, String> getCustomPanelIcons() {
+        return customPanelIcons;
+    }
+
+    public synchronized void setCustomPanelIcons(Map<String, String> customPanelIcons) {
+        this.customPanelIcons = customPanelIcons;
+    }
+
     // Goal B: opt-in lazy region paging. When true, compartmentalised .world.zip files load
     // tile coordinates only (cheap index from tile-index.bin); tile bodies are deserialised
     // on demand from per-region ZIP entries. Off by default — small/medium maps don't benefit
@@ -1442,6 +1457,9 @@ public final class Configuration implements Serializable, EventLogger, Minecraft
     // so JIDE bytes saved by release WP coexist with our DockingFrames bytes).
     private byte[] defaultDockingFramesLayoutData;
     private Map<String, byte[]> dockingFramesLayoutData;
+    // Task 8: per-panel icon overrides for user-created dock panels. See getCustomPanelIcons()
+    // for the sentinel-prefix format ("builtin:NAME" / "file:PATH").
+    private Map<String, String> customPanelIcons;
     // Goal B: opt-in lazy region paging. See isRegionPagingEnabled() for rationale.
     private boolean regionPagingEnabled;
     /** Max regions kept resident in lazy mode; 0 or negative = unlimited. See getter for sizing. */

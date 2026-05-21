@@ -76,6 +76,7 @@ import javax.swing.border.BevelBorder;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
 import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
 import java.beans.PropertyVetoException;
@@ -1877,10 +1878,149 @@ public final class App extends JFrame implements BrushControl,
     }
 
     void exit() {
+        // B2: persist the user's current docking-layout customisations before quitting. Until
+        // this call landed, the only save triggers were "switch dimension" and the "Save
+        // workspace layout" menu — closing without doing either evaporated every drag-drop
+        // arrangement the user had made. Reported by Arag 2026-05-18 ("po každém vypnutí to
+        // UIčko resetuje").
+        persistDockingLayoutQuietly();
         if (saveIfNecessary()) {
             System.exit(0);
         }
     }
+
+    /**
+     * B2: persist the current DockingFrames layout (split-bar positions, autohide popup sizes,
+     * externalised window bounds, tab arrangements — everything {@code CControl.write} captures)
+     * to {@link Configuration} on close. Writes to BOTH slots so the customisation applies
+     * regardless of whether a world is open at next launch:
+     * <ul>
+     *   <li>{@code defaultDockingFramesLayoutData} — applied on first launch before any world
+     *       is loaded, and by world-less code paths.</li>
+     *   <li>{@code dockingFramesLayoutData[<current-dim-uuid>]} — applied when that specific
+     *       world is reopened (the per-dim slot supersedes the default).</li>
+     * </ul>
+     * <p>Quiet: any I/O or serialisation failure logs at WARN but doesn't block exit. Losing
+     * the layout save is annoying but never a reason to refuse to quit.
+     */
+    private void persistDockingLayoutQuietly() {
+        if (dockingManager == null) {
+            return;
+        }
+        try {
+            final byte[] bytes = dockingManager.getLayoutRawData();
+            if ((bytes == null) || (bytes.length == 0)) {
+                return;
+            }
+            final Configuration config = Configuration.getInstance();
+            config.setDefaultDockingFramesLayoutData(bytes);
+            String dimKey = null;
+            if (dimension != null) {
+                Map<String, byte[]> dimMap = config.getDockingFramesLayoutData();
+                if (dimMap == null) {
+                    dimMap = new HashMap<>();
+                }
+                dimKey = dimension.getId().toString();
+                dimMap.put(dimKey, bytes);
+                config.setDockingFramesLayoutData(dimMap);
+            }
+            logger.info("Persisted docking layout: {} bytes to default{}",
+                    bytes.length, (dimKey != null) ? " + per-dim slot " + dimKey : " (no dim open)");
+        } catch (RuntimeException e) {
+            logger.warn("Failed to persist docking layout on exit", e);
+        }
+    }
+
+    /**
+     * Task 8: resolve the icon for a user-created custom dock panel. Looks up any stored
+     * override in {@link Configuration#getCustomPanelIcons()} keyed by {@code panelId}. The
+     * override value is a sentinel-prefixed string:
+     * <ul>
+     *   <li>{@code "builtin:NAME"} — load the named icon from the bundled WP icons.</li>
+     *   <li>{@code "file:ABSOLUTE_PATH"} — load the file from disk. Missing file → fall back
+     *       to auto, log WARN.</li>
+     * </ul>
+     * No entry (or null) → fall back to {@link AutoPanelIcon#generate(String)} keyed on the
+     * panel title.
+     */
+    private Icon resolveCustomPanelIcon(String panelId, String panelTitle) {
+        final Icon stored = resolveStoredIconOverride(panelId);
+        return (stored != null) ? stored : AutoPanelIcon.generate(panelTitle);
+    }
+
+    /**
+     * Task 8: load just the user's stored icon override for {@code panelId}, returning
+     * {@code null} if no override is set. Used by the universal apply-on-load pass
+     * ({@link com.jidesoft.docking.DockingManager#applyIconOverridesToAll}) — for panels
+     * that the user has not customised, returning null leaves the existing icon untouched
+     * (which for standard panels is their built-in icon and for custom panels is the
+     * auto-generated letter+colour icon set at construction time).
+     */
+    private Icon resolveStoredIconOverride(String panelId) {
+        final Map<String, String> overrides = Configuration.getInstance().getCustomPanelIcons();
+        if ((overrides == null) || ! overrides.containsKey(panelId)) {
+            return null;
+        }
+        final String spec = overrides.get(panelId);
+        if (spec == null) {
+            return null;
+        }
+        if (spec.startsWith("builtin:")) {
+            // Many bundled icons (MC block textures, e.g. lava.png 150×150) are larger than
+            // the 16-pixel title-bar slot. IconUtils.loadScaledIcon does DPI scaling but not
+            // size clamping, so force a 16×16 scale here.
+            final ImageIcon raw = IconUtils.loadScaledIcon(
+                    "org/pepsoft/worldpainter/icons/" + spec.substring("builtin:".length()) + ".png");
+            if (raw != null) {
+                return IconUtils.scaleIcon(raw, 16);
+            }
+        } else if (spec.startsWith("file:")) {
+            final File f = new File(spec.substring("file:".length()));
+            if (f.isFile()) {
+                try {
+                    final BufferedImage img = ImageIO.read(f);
+                    if (img != null) {
+                        return new ImageIcon(IconUtils.scaleIcon(img, 16));
+                    }
+                } catch (IOException e) {
+                    logger.warn("Custom panel icon could not be loaded from {}: {}", f, e.toString());
+                }
+            } else {
+                logger.warn("Custom panel icon file is missing: {} — leaving default", f);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Task 8: invoked when the user clicks "Change icon..." in a custom panel's title-bar
+     * context menu (action attached via {@code dockingManager.attachIconChooserAction}).
+     * Opens {@link IconPickerDialog}, persists the user's choice into
+     * {@link Configuration#setCustomPanelIcons}, and updates the dockable's title icon in
+     * place via {@code dockingManager.setFrameIcon}.
+     */
+    private void openIconPickerFor(String panelId, String panelTitle) {
+        final IconPickerDialog.Result picked = IconPickerDialog.showDialog(
+                this, panelTitle, AutoPanelIcon.generate(panelTitle));
+        if (picked == null) {
+            return;  // cancelled
+        }
+        final Configuration config = Configuration.getInstance();
+        Map<String, String> overrides = config.getCustomPanelIcons();
+        if (overrides == null) {
+            overrides = new HashMap<>();
+        }
+        if (picked.isUseAuto()) {
+            overrides.remove(panelId);
+        } else {
+            overrides.put(panelId, picked.toSentinel());
+        }
+        config.setCustomPanelIcons(overrides);
+        // Update the panel's title icon immediately so the user sees the change without
+        // restarting WP.
+        dockingManager.setFrameIcon(panelId, resolveCustomPanelIcon(panelId, panelTitle));
+    }
+
 
     void pushGlassPaneComponent(Component component) {
         glassPane.pushPanelComponent(component);
@@ -2825,9 +2965,15 @@ public final class App extends JFrame implements BrushControl,
             if (entry.getKey().equals(CUSTOM_BRUSHES_DEFAULT_TITLE)) {
                 continue;
             }
-            dockingManager.addFrame(new DockableFrameBuilder(createCustomBrushPanel(entry.getKey(), entry.getValue()), entry.getKey(), DOCK_SIDE_EAST, 1).withId("customBrushes." + entry.getKey()).scrollable().build());
+            // Task 8: user-created custom brush groups get a stored override (if set) or an
+            // auto-generated icon (letter + colour from the group name) so they're
+            // distinguishable in autohide strips. The "Change icon..." right-click action is
+            // attached universally below via attachIconChooserActionToAll.
+            final String panelId = "customBrushes." + entry.getKey();
+            final Icon panelIcon = resolveCustomPanelIcon(panelId, entry.getKey());
+            dockingManager.addFrame(new DockableFrameBuilder(createCustomBrushPanel(entry.getKey(), entry.getValue()), entry.getKey(), DOCK_SIDE_EAST, 1).withId(panelId).scrollable().withIcon(panelIcon).build());
         }
-        
+
         dockingManager.addFrame(new DockableFrameBuilder(createBrushSettingsPanel(), "Brush Settings", DOCK_SIDE_EAST, 2).withId("brushSettings").build());
 
         infoPanel = createInfoPanel();
@@ -2835,16 +2981,32 @@ public final class App extends JFrame implements BrushControl,
 
         if (config.getDefaultDockingFramesLayoutData() != null) {
             // Our fork's own DockingFrames bytes — preferred path.
-            dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultDockingFramesLayoutData()));
+            final byte[] data = config.getDefaultDockingFramesLayoutData();
+            logger.info("Restoring docking layout from defaultDockingFramesLayoutData ({} bytes)", data.length);
+            dockingManager.loadLayoutFrom(new ByteArrayInputStream(data));
         } else if (config.getDefaultJideLayoutData() != null) {
             // First launch of our fork against an existing release-WP config: the JIDE bytes are
             // here and our DockingFrames bytes haven't been written yet. Pass them through —
             // DockingManager.loadLayoutFrom has JIDE-import fallback that parses the JIDE
             // format and reconstructs the panel arrangement.
+            logger.info("No DockingFrames layout saved — falling back to defaultJideLayoutData ({} bytes)",
+                    config.getDefaultJideLayoutData().length);
             dockingManager.loadLayoutFrom(new ByteArrayInputStream(config.getDefaultJideLayoutData()));
         } else {
+            logger.info("No saved docking layout — deploying default");
             dockingManager.resetToDefault();
         }
+
+        // Task 8: wire the "Change icon..." right-click action to EVERY registered dockable,
+        // and arm the auto-attach hook so future panels (e.g. custom layer palettes registered
+        // after world load) get it too. Universal scope — every panel, not just custom ones —
+        // per the user's explicit request.
+        dockingManager.attachIconChooserActionToAll(this::openIconPickerFor);
+        // Task 8: also apply any stored icon overrides to every dockable, and arm the resolver
+        // so post-deploy panels get their overrides applied at registration time too. Without
+        // this pass, icons chosen via the picker were saved into Configuration but never
+        // re-applied on the next launch — the user saw the customisation evaporate.
+        dockingManager.applyIconOverridesToAll((panelId, panelTitle) -> resolveStoredIconOverride(panelId));
 
         MouseAdapter viewListener = new MouseAdapter() {
             @Override
