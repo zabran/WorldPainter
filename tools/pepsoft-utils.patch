@@ -1,0 +1,61 @@
+diff --git a/pom.xml b/pom.xml
+index 0267d42..6a2188d 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -6,7 +6,7 @@
+ 
+     <groupId>org.pepsoft.utils</groupId>
+     <artifactId>Utils</artifactId>
+-    <version>2.0.2-SNAPSHOT</version>
++    <version>2.0.2-local</version>
+ 
+     <name>Utils</name>
+     <description>Various utility classes used by pepsoft.org projects.</description>
+diff --git a/src/main/java/org/pepsoft/util/UnsafeRandom.java b/src/main/java/org/pepsoft/util/UnsafeRandom.java
+index 9b2638b..1e2cfcd 100644
+--- a/src/main/java/org/pepsoft/util/UnsafeRandom.java
++++ b/src/main/java/org/pepsoft/util/UnsafeRandom.java
+@@ -7,8 +7,8 @@ import java.util.Random;
+  *
+  * @author <a href="https://github.com/MCRcortex">MCRcortex</a>
+  */
+-class UnsafeRandom {
+-    UnsafeRandom(long seed) {
++public class UnsafeRandom {
++    public UnsafeRandom(long seed) {
+         this.seed = seed ^ MUL;
+     }
+ 
+@@ -20,7 +20,31 @@ class UnsafeRandom {
+         return (int) ((this.next() & MSK) >> (48 - bits));
+     }
+ 
+-    int nextInt(int bound) {
++    /**
++     * Stateless variant: applies the same LCG once to the supplied seed and returns a value in
++     * {@code [0, bound)}. Drop-in replacement for {@code new UnsafeRandom(seed).nextInt(bound)}
++     * but without the allocation, for hot loops that want a deterministic seed-derived sample
++     * without keeping a stateful generator around.
++     */
++    public static int fastNextInt(long seed, int bound) {
++        long s = ((seed ^ MUL) * MUL + ADD) & MSK;
++        int r = (int) (s >> 17); // 31 bits
++        int m = bound - 1;
++        if ((bound & m) == 0) {
++            // power of two: cheap multiply-shift
++            return (int) ((bound * (long) r) >> 31);
++        }
++        return r % bound;
++    }
++
++    /**
++     * Uniformly distributed {@code float} in {@code [0.0f, 1.0f)}, advancing the generator.
++     */
++    public float nextFloat() {
++        return next(24) / ((float) (1 << 24));
++    }
++
++    public int nextInt(int bound) {
+         int r = next(31);
+         final int m = bound - 1;
+         if ((bound & m) == 0) { // i.e., bound is a power of 2
